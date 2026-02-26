@@ -931,6 +931,17 @@ class ExportASE(bpy.types.Operator, ExportHelper):
         default=False,
     )
 
+    option_lod_groups: BoolProperty(
+        name="Export LOD groups",
+        description=(
+            "Export Empty-based LOD groups. Each selected Empty that has "
+            "parented mesh children is exported as a single .ase file "
+            "named after the Empty. All child meshes become GEOMOBJECTs "
+            "in that file. Unparented meshes are ignored"
+        ),
+        default=False,
+    )
+
     def draw(self, context):
         layout = self.layout
 
@@ -949,24 +960,14 @@ class ExportASE(bpy.types.Operator, ExportHelper):
         box.prop(self, 'option_scale')
         box.prop(self, 'option_individual')
         box.prop(self, 'option_split_per_material')
+        box.prop(self, 'option_lod_groups')
 
     @classmethod
     def poll(cls, context):
-        return any(obj.type == 'MESH' for obj in context.selected_objects)
+        return any(obj.type in {'MESH', 'EMPTY'} for obj in context.selected_objects)
 
     def execute(self, context):
         start = time.perf_counter()
-
-        # Collect selected mesh objects
-        mesh_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
-        if not mesh_objects:
-            self.report({'ERROR'}, 'No mesh objects selected')
-            return {'CANCELLED'}
-
-        print(f'\nASE Export: {len(mesh_objects)} mesh object(s) selected')
-
-        # Build a transform matrix per object to bake into vertex positions.
-        # This is fully non-destructive: we never modify the original objects.
 
         options = {
             'scale': self.option_scale,
@@ -978,6 +979,57 @@ class ExportASE(bpy.types.Operator, ExportHelper):
 
         try:
             builder = ASEBuilder(context, options)
+
+            if self.option_lod_groups:
+                # LOD Groups mode: each selected Empty with mesh children
+                # becomes one ASE file named after the Empty.
+                base_dir = os.path.dirname(self.filepath)
+                empties = [obj for obj in context.selected_objects
+                           if obj.type == 'EMPTY']
+                if not empties:
+                    self.report({'ERROR'},
+                                'No Empty objects selected for LOD group export')
+                    return {'CANCELLED'}
+
+                exported = 0
+                for empty in empties:
+                    # Collect mesh children of this Empty
+                    children = [child for child in empty.children
+                                if child.type == 'MESH']
+                    if not children:
+                        print(f'ASE Export: Empty "{empty.name}" has no '
+                              f'mesh children, skipping')
+                        continue
+
+                    print(f'ASE Export: LOD group "{empty.name}" with '
+                          f'{len(children)} mesh(es)')
+
+                    ase_content = builder.build(children)
+                    filename = os.path.join(
+                        base_dir,
+                        empty.name.replace('.', '_') + '.ase')
+                    self._write_file(filename, ase_content)
+                    exported += 1
+
+                if exported == 0:
+                    self.report({'ERROR'},
+                                'No LOD groups found (Empties with mesh children)')
+                    return {'CANCELLED'}
+
+                elapsed = time.perf_counter() - start
+                print(f'ASE Export: {exported} LOD group(s) in {elapsed:.3f}s')
+                self.report({'INFO'},
+                            f'Exported {exported} LOD group(s) in {elapsed:.3f}s')
+                return {'FINISHED'}
+
+            # Non-LOD modes: collect selected mesh objects
+            mesh_objects = [obj for obj in context.selected_objects
+                           if obj.type == 'MESH']
+            if not mesh_objects:
+                self.report({'ERROR'}, 'No mesh objects selected')
+                return {'CANCELLED'}
+
+            print(f'\nASE Export: {len(mesh_objects)} mesh object(s) selected')
 
             if self.option_split_per_material:
                 # Split mode: each object produces multiple chunk files
