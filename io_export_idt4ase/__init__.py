@@ -779,12 +779,18 @@ class ASEBuilder:
                     f'\t\t\t*MESH_CFACE {fi}\t{base}\t{base + 1}\t{base + 2}\n')
             lines.append(f'\t\t}}\n')
 
-        # Normals - use split normals (per-loop) for correct hard/soft edge export
+        # Normals - use split normals (per-loop) for correct hard/soft edge export.
+        # Sharp edges produce different normals on each side, which the engine
+        # uses to determine shading. Smoothing groups are ignored by idTech 4.
         lines.append(f'\t\t*MESH_NORMALS {{\n')
 
-        # Try to use split normals for accurate per-loop normals
+        # Blender 4.1+: corner_normals provides per-loop split normals directly.
+        # Blender <4.1: calc_normals_split() must be called first, then
+        #   mesh.loops[i].normal is available.
+        # Fallback: mesh.vertices[v].normal (averaged, loses sharp edges).
+        has_corner_normals = hasattr(mesh, 'corner_normals') and len(mesh.corner_normals) > 0
         use_split_normals = False
-        if hasattr(mesh, 'calc_normals_split'):
+        if not has_corner_normals and hasattr(mesh, 'calc_normals_split'):
             mesh.calc_normals_split()
             use_split_normals = True
 
@@ -796,7 +802,9 @@ class ASEBuilder:
 
             for loop_idx in poly.loop_indices:
                 vert_idx = mesh.loops[loop_idx].vertex_index
-                if use_split_normals:
+                if has_corner_normals:
+                    raw_n = mesh.corner_normals[loop_idx].vector
+                elif use_split_normals:
                     raw_n = mesh.loops[loop_idx].normal
                 else:
                     raw_n = mesh.vertices[vert_idx].normal
