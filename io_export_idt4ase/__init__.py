@@ -19,7 +19,7 @@
 bl_info = {
     "name": "ASE Exporter for idTech 4",
     "author": "Richard Bartlett, MCampagnini, scorpion81, motorsep/Claude",
-    "version": (3, 0, 0),
+    "version": (3, 5, 0),
     "blender": (4, 2, 0),
     "location": "File > Export > ASCII Scene Export (.ase)",
     "description": "Export static meshes to ASCII Scene Export (.ase) format for idTech 4",
@@ -277,8 +277,10 @@ class ASEBuilder:
             bm_chunk.to_mesh(chunk_mesh)
             bm_chunk.free()
 
-            # Triangulate if needed
-            if self.options['triangulate']:
+            # Triangulate chunk if needed (same logic as _get_evaluated_bmesh)
+            apply_mods = self.options.get('apply_modifiers', True)
+            has_tri_mod = any(mod.type == 'TRIANGULATE' for mod in obj.modifiers)
+            if not (apply_mods and has_tri_mod):
                 self._triangulate_mesh(chunk_mesh)
 
             # Build ASE for this chunk
@@ -436,15 +438,35 @@ class ASEBuilder:
         return mat
 
     def _get_evaluated_bmesh(self, obj):
-        """Get a triangulated bmesh from the evaluated (modifier-applied) object.
+        """Get a triangulated bmesh from the object.
+
+        If apply_modifiers is True:
+          - Uses the evaluated (modifier-applied) mesh via depsgraph.
+          - If a Triangulate modifier is present, its output is already
+            triangulated so no extra triangulation is done.
+          - If no Triangulate modifier exists, auto-triangulates.
+        If apply_modifiers is False:
+          - Uses the raw mesh data (modifiers ignored).
+          - Always triangulates.
 
         Returns (mesh, bmesh) - caller must free both when done.
         """
-        depsgraph = self.context.evaluated_depsgraph_get()
-        obj_eval = obj.evaluated_get(depsgraph)
-        mesh = bpy.data.meshes.new_from_object(obj_eval)
+        apply_mods = self.options.get('apply_modifiers', True)
 
-        if self.options['triangulate']:
+        if apply_mods:
+            depsgraph = self.context.evaluated_depsgraph_get()
+            obj_eval = obj.evaluated_get(depsgraph)
+            mesh = bpy.data.meshes.new_from_object(obj_eval)
+
+            # Check if a Triangulate modifier was present on the object
+            has_tri_mod = any(
+                mod.type == 'TRIANGULATE' for mod in obj.modifiers)
+
+            if not has_tri_mod:
+                self._triangulate_mesh(mesh)
+        else:
+            # Ignore modifiers: get raw mesh data
+            mesh = bpy.data.meshes.new_from_object(obj)
             self._triangulate_mesh(mesh)
 
         bm = bmesh.new()
@@ -464,13 +486,80 @@ class ASEBuilder:
         bm.free()
 
     def _build_geomobject(self, obj):
-        """Build a GEOMOBJECT block for a Blender object."""
+        """Build GEOMOBJECT block(s) for a Blender object.
+
+        idTech 4 resolves materials per-GEOMOBJECT via MATERIAL_REF.
+        MESH_MTLID is ignored by the engine parser. Therefore, if an
+        object has multiple materials, we must split it into separate
+        GEOMOBJECTs — one per material — each with its own MATERIAL_REF.
+
+        Returns a string containing one or more GEOMOBJECT blocks.
+        """
         mesh, bm = self._get_evaluated_bmesh(obj)
         xform = self._compute_transform_matrix(obj)
-        result = self._build_geomobject_from_data(obj.name, mesh, bm, obj, xform=xform)
+
+        # Determine which material indices are actually used by faces
+        used_mat_indices = sorted(set(f.material_index for f in bm.faces))
+
+        # Single material (or no material variation): export as one GEOMOBJECT
+        if len(used_mat_indices) <= 1:
+            mat_idx = used_mat_indices[0] if used_mat_indices else 0
+            mat_ref = 0
+            if mat_idx < len(obj.material_slots) and obj.material_slots[mat_idx].material:
+                mat_name = obj.material_slots[mat_idx].material.name
+                mat_ref = self.mat_name_to_index.get(mat_name, 0)
+
+            result = self._build_geomobject_from_data(
+                obj.name, mesh, bm, obj, mat_ref, xform=xform)
+            bm.free()
+            bpy.data.meshes.remove(mesh)
+            return result
+
+        # Multiple materials: split into separate GEOMOBJECTs
+        results = []
+        for mat_idx in used_mat_indices:
+            # Determine the global material index for MATERIAL_REF
+            mat_ref = 0
+            geom_name = obj.name
+            if mat_idx < len(obj.material_slots) and obj.material_slots[mat_idx].material:
+                mat_name = obj.material_slots[mat_idx].material.name
+                mat_ref = self.mat_name_to_index.get(mat_name, 0)
+                # Name sub-objects: objectname_materialname
+                geom_name = f'{obj.name}_{mat_name}'
+
+            # Clone bmesh and keep only faces for this material
+            bm_sub = bm.copy()
+            faces_to_remove = [f for f in bm_sub.faces
+                               if f.material_index != mat_idx]
+            for f in faces_to_remove:
+                bm_sub.faces.remove(f)
+
+            # Remove orphan vertices
+            verts_to_remove = [v for v in bm_sub.verts if not v.link_faces]
+            for v in verts_to_remove:
+                bm_sub.verts.remove(v)
+
+            if len(bm_sub.faces) == 0:
+                bm_sub.free()
+                continue
+
+            bm_sub.faces.ensure_lookup_table()
+            bm_sub.verts.ensure_lookup_table()
+            bm_sub.edges.ensure_lookup_table()
+
+            # Create temporary mesh for the sub-object
+            sub_mesh = bpy.data.meshes.new(f'_ase_sub_{mat_idx}')
+            bm_sub.to_mesh(sub_mesh)
+
+            results.append(self._build_geomobject_from_data(
+                geom_name, sub_mesh, bm_sub, obj, mat_ref, xform=xform))
+
+            bm_sub.free()
+            bpy.data.meshes.remove(sub_mesh)
+
         bm.free()
         bpy.data.meshes.remove(mesh)
-        return result
+        return ''.join(results)
 
     def _build_geomobject_from_mesh(self, name, mesh, obj, material_ref, xform=None):
         """Build a GEOMOBJECT from an already-prepared mesh object."""
@@ -492,7 +581,6 @@ class ASEBuilder:
         It writes vertices, faces, UVs, vertex colors, and normals.
         """
         scale = self.options['scale']
-        use_smoothing = self.options['smoothing_groups']
 
         # Validate all faces are triangles
         for face in bm.faces:
@@ -504,15 +592,20 @@ class ASEBuilder:
         num_verts = len(bm.verts)
         num_faces = len(bm.faces)
 
-        # Compute smoothing groups if needed
+        # Auto-detect whether smoothing groups are needed:
+        # If any edge is sharp, export smoothing groups from sharp edge topology.
+        # If all edges are smooth, export a single smoothing group (group 1).
+        has_sharp_edges = any(not e.smooth for e in bm.edges)
         smoothing_groups = {}
-        if use_smoothing:
+        if has_sharp_edges:
             smoothing_groups = compute_smoothing_groups(bm)
+        else:
+            # All smooth: single smoothing group for entire mesh
+            for face in bm.faces:
+                smoothing_groups[face.index] = 1
 
-        # Determine material ref (for the GEOMOBJECT's MATERIAL_REF)
-        # With a flat material list, MATERIAL_REF is 0 and per-face
-        # MESH_MTLID indexes directly into the global material list.
-        # When split-per-material provides an override, use that instead.
+        # MATERIAL_REF: determines which global material this GEOMOBJECT uses.
+        # Always passed explicitly by _build_geomobject.
         if material_ref_override is not None:
             mat_ref = material_ref_override
         else:
@@ -551,13 +644,9 @@ class ASEBuilder:
         lines.append(f'\t\t*MESH_FACE_LIST {{\n')
         for face in bm.faces:
             v = face.verts
-            # Material ID for this face
-            mat_idx = face.material_index
-            if mat_idx < len(obj.material_slots) and obj.material_slots[mat_idx].material:
-                mat_name = obj.material_slots[mat_idx].material.name
-                mtl_id = self.mat_name_to_index.get(mat_name, 0)
-            else:
-                mtl_id = 0
+            # MESH_MTLID is ignored by idTech 4 engine; material is
+            # resolved per-GEOMOBJECT via MATERIAL_REF. Write 0 always.
+            mtl_id = 0
 
             # Smoothing group
             sg = smoothing_groups.get(face.index, 0)
@@ -638,31 +727,48 @@ class ASEBuilder:
                 lines.append(f'\t\t\t}}\n')
                 lines.append(f'\t\t}}\n')
 
-        # Vertex colors
-        vc_layer = None
-        if mesh.color_attributes:
-            # Prefer the active color attribute
-            vc_layer = mesh.color_attributes.active_color
-        # Fallback for older API
-        if vc_layer is None and hasattr(mesh, 'vertex_colors') and mesh.vertex_colors:
-            vc_layer = mesh.vertex_colors.active
+        # Vertex colors — read from bmesh loop color layers (reliable even
+        # for sub-meshes created via bm.to_mesh on a fresh Mesh object,
+        # where mesh.color_attributes may be empty or misconfigured).
+        bm_color_layer = None
+        if bm.loops.layers.color:
+            bm_color_layer = bm.loops.layers.color.active
 
-        if vc_layer is not None:
+        # Fallback: try mesh.color_attributes / vertex_colors
+        mesh_vc_layer = None
+        if bm_color_layer is None:
+            if mesh.color_attributes and mesh.color_attributes.active_color:
+                mesh_vc_layer = mesh.color_attributes.active_color
+            elif hasattr(mesh, 'vertex_colors') and mesh.vertex_colors:
+                mesh_vc_layer = mesh.vertex_colors.active
+
+        if bm_color_layer is not None or mesh_vc_layer is not None:
             num_cverts = num_faces * 3
             lines.append(f'\t\t*MESH_NUMCVERTEX {num_cverts}\n')
             lines.append(f'\t\t*MESH_CVERTLIST {{\n')
 
             cvert_idx = 0
-            for poly in mesh.polygons:
-                for loop_idx in poly.loop_indices:
-                    if hasattr(vc_layer, 'data') and len(vc_layer.data) > loop_idx:
-                        color = vc_layer.data[loop_idx].color
-                    else:
-                        color = (1.0, 1.0, 1.0, 1.0)
-                    lines.append(
-                        f'\t\t\t*MESH_VERTCOL {cvert_idx}\t'
-                        f'{ase_float(color[0])}\t{ase_float(color[1])}\t{ase_float(color[2])}\n')
-                    cvert_idx += 1
+            if bm_color_layer is not None:
+                # Read from bmesh (preferred — works for split meshes)
+                for face in bm.faces:
+                    for loop in face.loops:
+                        color = loop[bm_color_layer]
+                        lines.append(
+                            f'\t\t\t*MESH_VERTCOL {cvert_idx}\t'
+                            f'{ase_float(color[0])}\t{ase_float(color[1])}\t{ase_float(color[2])}\n')
+                        cvert_idx += 1
+            else:
+                # Fallback: read from mesh data
+                for poly in mesh.polygons:
+                    for loop_idx in poly.loop_indices:
+                        if hasattr(mesh_vc_layer, 'data') and len(mesh_vc_layer.data) > loop_idx:
+                            color = mesh_vc_layer.data[loop_idx].color
+                        else:
+                            color = (1.0, 1.0, 1.0, 1.0)
+                        lines.append(
+                            f'\t\t\t*MESH_VERTCOL {cvert_idx}\t'
+                            f'{ase_float(color[0])}\t{ase_float(color[1])}\t{ase_float(color[2])}\n')
+                        cvert_idx += 1
             lines.append(f'\t\t}}\n')
 
             lines.append(f'\t\t*MESH_NUMCVFACES {num_faces}\n')
@@ -758,9 +864,15 @@ class ExportASE(bpy.types.Operator, ExportHelper):
 
     # -- Essentials --
 
-    option_triangulate: BoolProperty(
-        name="Triangulate",
-        description="Triangulate all meshes (required if mesh has quads/ngons)",
+    option_apply_modifiers: BoolProperty(
+        name="Apply Modifiers",
+        description=(
+            "Apply modifiers before exporting. "
+            "If a Triangulate modifier is present, it will be used. "
+            "If not, the mesh is triangulated automatically. "
+            "When unchecked, modifiers are ignored and the mesh is "
+            "triangulated directly"
+        ),
         default=True,
     )
 
@@ -791,7 +903,7 @@ class ExportASE(bpy.types.Operator, ExportHelper):
         description=(
             "Multiply all vertex positions by this factor. "
             "idTech 4 uses roughly 1 unit = 1 inch. "
-            "Default 16.0 scales 1 Blender unit (1m) to ~16 Doom units"
+            "Default 1.0 exports at Blender's native scale"
         ),
         min=0.001,
         max=10000.0,
@@ -800,9 +912,12 @@ class ExportASE(bpy.types.Operator, ExportHelper):
         default=1.0,
     )
 
-    option_separate: BoolProperty(
-        name="Separate files per object",
-        description="Write a separate .ase file for each selected object",
+    option_individual: BoolProperty(
+        name="Export individual models",
+        description=(
+            "Export each selected object as its own .ase file. "
+            "Useful for batch-exporting a scene of separate models"
+        ),
         default=False,
     )
 
@@ -816,22 +931,12 @@ class ExportASE(bpy.types.Operator, ExportHelper):
         default=False,
     )
 
-    option_smoothing_groups: BoolProperty(
-        name="Smoothing Groups",
-        description=(
-            "Export smoothing groups based on sharp edges. "
-            "Auto-detected: if mesh is fully smooth with no sharp edges, "
-            "a single smoothing group is used"
-        ),
-        default=True,
-    )
-
     def draw(self, context):
         layout = self.layout
 
         box = layout.box()
         box.label(text='Essentials:')
-        box.prop(self, 'option_triangulate')
+        box.prop(self, 'option_apply_modifiers')
 
         box = layout.box()
         box.label(text='Transformations:')
@@ -842,9 +947,8 @@ class ExportASE(bpy.types.Operator, ExportHelper):
         box = layout.box()
         box.label(text='Advanced:')
         box.prop(self, 'option_scale')
-        box.prop(self, 'option_separate')
+        box.prop(self, 'option_individual')
         box.prop(self, 'option_split_per_material')
-        box.prop(self, 'option_smoothing_groups')
 
     @classmethod
     def poll(cls, context):
@@ -866,8 +970,7 @@ class ExportASE(bpy.types.Operator, ExportHelper):
 
         options = {
             'scale': self.option_scale,
-            'triangulate': self.option_triangulate,
-            'smoothing_groups': self.option_smoothing_groups,
+            'apply_modifiers': self.option_apply_modifiers,
             'apply_location': self.option_apply_location,
             'apply_rotation': self.option_apply_rotation,
             'apply_scale': self.option_apply_scale,
@@ -887,8 +990,8 @@ class ExportASE(bpy.types.Operator, ExportHelper):
                             base_dir, f'{obj.name}{suffix}.ase')
                         self._write_file(chunk_path, ase_content)
 
-            elif self.option_separate:
-                # Separate mode: one file per object
+            elif self.option_individual:
+                # Individual mode: one file per object
                 base_dir = os.path.dirname(self.filepath)
                 for obj in mesh_objects:
                     ase_content = builder.build([obj])
