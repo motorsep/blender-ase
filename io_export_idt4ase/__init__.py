@@ -979,21 +979,18 @@ class ExportASE(bpy.types.Operator, ExportHelper):
 
         try:
             builder = ASEBuilder(context, options)
+            base_dir = os.path.dirname(self.filepath)
+
+            # Track which mesh objects are consumed by LOD groups
+            lod_children = set()
 
             if self.option_lod_groups:
-                # LOD Groups mode: each selected Empty with mesh children
+                # LOD Groups: each selected Empty with mesh children
                 # becomes one ASE file named after the Empty.
-                base_dir = os.path.dirname(self.filepath)
                 empties = [obj for obj in context.selected_objects
                            if obj.type == 'EMPTY']
-                if not empties:
-                    self.report({'ERROR'},
-                                'No Empty objects selected for LOD group export')
-                    return {'CANCELLED'}
 
-                exported = 0
                 for empty in empties:
-                    # Collect mesh children of this Empty
                     children = [child for child in empty.children
                                 if child.type == 'MESH']
                     if not children:
@@ -1009,52 +1006,44 @@ class ExportASE(bpy.types.Operator, ExportHelper):
                         base_dir,
                         empty.name.replace('.', '_') + '.ase')
                     self._write_file(filename, ase_content)
-                    exported += 1
 
-                if exported == 0:
-                    self.report({'ERROR'},
-                                'No LOD groups found (Empties with mesh children)')
-                    return {'CANCELLED'}
+                    # Mark these meshes as consumed
+                    for child in children:
+                        lod_children.add(child)
 
-                elapsed = time.perf_counter() - start
-                print(f'ASE Export: {exported} LOD group(s) in {elapsed:.3f}s')
-                self.report({'INFO'},
-                            f'Exported {exported} LOD group(s) in {elapsed:.3f}s')
-                return {'FINISHED'}
-
-            # Non-LOD modes: collect selected mesh objects
+            # Collect remaining selected mesh objects (not part of LOD groups)
             mesh_objects = [obj for obj in context.selected_objects
-                           if obj.type == 'MESH']
-            if not mesh_objects:
-                self.report({'ERROR'}, 'No mesh objects selected')
+                           if obj.type == 'MESH' and obj not in lod_children]
+
+            if not mesh_objects and not lod_children:
+                self.report({'ERROR'}, 'No mesh objects or LOD groups found')
                 return {'CANCELLED'}
 
-            print(f'\nASE Export: {len(mesh_objects)} mesh object(s) selected')
+            if mesh_objects:
+                print(f'ASE Export: {len(mesh_objects)} loose mesh object(s)')
 
-            if self.option_split_per_material:
-                # Split mode: each object produces multiple chunk files
-                for obj in mesh_objects:
-                    chunks = builder.build_split(obj)
-                    base_dir = os.path.dirname(self.filepath)
+                if self.option_split_per_material:
+                    # Split mode: each object produces multiple chunk files
+                    for obj in mesh_objects:
+                        chunks = builder.build_split(obj)
 
-                    for suffix, ase_content in chunks:
-                        chunk_path = os.path.join(
-                            base_dir, f'{obj.name}{suffix}.ase')
-                        self._write_file(chunk_path, ase_content)
+                        for suffix, ase_content in chunks:
+                            chunk_path = os.path.join(
+                                base_dir, f'{obj.name}{suffix}.ase')
+                            self._write_file(chunk_path, ase_content)
 
-            elif self.option_individual:
-                # Individual mode: one file per object
-                base_dir = os.path.dirname(self.filepath)
-                for obj in mesh_objects:
-                    ase_content = builder.build([obj])
-                    filename = os.path.join(
-                        base_dir, obj.name.replace('.', '_') + '.ase')
-                    self._write_file(filename, ase_content)
+                elif self.option_individual:
+                    # Individual mode: one file per object
+                    for obj in mesh_objects:
+                        ase_content = builder.build([obj])
+                        filename = os.path.join(
+                            base_dir, obj.name.replace('.', '_') + '.ase')
+                        self._write_file(filename, ase_content)
 
-            else:
-                # Normal mode: all objects in one file
-                ase_content = builder.build(mesh_objects)
-                self._write_file(self.filepath, ase_content)
+                else:
+                    # Normal mode: all objects in one file
+                    ase_content = builder.build(mesh_objects)
+                    self._write_file(self.filepath, ase_content)
 
         except RuntimeError as e:
             self.report({'ERROR'}, str(e))
