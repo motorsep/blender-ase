@@ -1,1078 +1,1095 @@
-## ***** BEGIN GPL LICENSE BLOCK ***** 
-# 
-# This program is free software; you can redistribute it and/or 
-# modify it under the terms of the GNU General Public License 
-# as published by the Free Software Foundation; either version 2 
-# of the License, or (at your option) any later version. 
-# 
-# This program is distributed in the hope that it will be useful, 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the 
-# GNU General Public License for more details. 
-# 
-# You should have received a copy of the GNU General Public License 
-# along with this program; if not, write to the Free Software Foundation, 
-# Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA. 
-# 
-# ***** END GPL LICENCE BLOCK *****
-# 
+## ***** BEGIN GPL LICENSE BLOCK *****
 #
-# REQUIRED OPTIONS -
-# - Make Normals Consistent
-# - Remove Doubles
-# **********************************
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software Foundation,
+# Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+#
+# ***** END GPL LICENCE BLOCK *****
+
 bl_info = {
-    "name": "ASCII Scene Exporter v2.5.8 (Updated for Blender 4.x)",
-    "author": "Richard Bartlett, MCampagnini, scorpion81( copy/separate option, fix for non-udk materials, material name only specification, ui cleanup); Updated by Grok",
-    "version": (2, 5, 8),
+    "name": "ASE Exporter for idTech 4",
+    "author": "Richard Bartlett, MCampagnini, scorpion81, motorsep/Claude",
+    "version": (3, 5, 0),
     "blender": (4, 2, 0),
-    "location": "File > Export > ASCII Scene Export(.ase)",
-    "description": "ASCII Scene Export(.ase) v2.5.8",
+    "location": "File > Export > ASCII Scene Export (.ase)",
+    "description": "Export static meshes to ASCII Scene Export (.ase) format for idTech 4",
     "warning": "",
     "wiki_url": "",
     "tracker_url": "",
-    "category": "Import-Export"
+    "category": "Import-Export",
 }
 
 """
---  This script is intended to export in the ASE file format for STATIC MESHES ONLY.
---  This script WILL NOT export skeletal meshes, these should be exported using a
---  different file format.
+ASE Exporter for idTech 4 (Doom 3, Quake 4, Prey, Dark Mod, etc.)
 
---  More Information at http://code.google.com/p/ase-export-vmc/
---  UDK Thread at http://forums.epicgames.com/threads/776986-Blender-2-57-ASE-export
+Exports selected mesh objects as .ase files compatible with idTech 4 engine.
+Supports multiple materials, vertex colors, smoothing groups, and UV channels.
+
+Non-destructive: all operations work on evaluated copies of the mesh data,
+the original scene and objects are never modified.
 """
 
 import os
 import bpy
-import math
-import time
 import bmesh
+import time
+from bpy_extras.io_utils import ExportHelper
+from bpy.props import StringProperty, BoolProperty, FloatProperty
 
-# settings
-aseFloat = lambda x: '''{0: 0.4f}'''.format(x)
-optionScale = 16.0
-optionSubmaterials = False
-optionSmoothingGroups = False
-optionAllowMultiMats = True
 
-# ASE components
-aseHeader = ''
-aseScene = ''
-aseMaterials = ''
-aseGeometry = ''
+# =============================================================================
+# Formatting helpers
+# =============================================================================
 
-# Other
-matList = []
-numMats = 0
-currentMatId = 0
+def ase_float(x):
+    """Format a float to 4 decimal places with ASE-style spacing."""
+    return f'{x: 0.4f}'
 
-# Helper functions for materials in Blender 4.x (node-based)
+
+def ase_color(r, g, b):
+    """Format an RGB color triplet."""
+    return f'{ase_float(r)}\t{ase_float(g)}\t{ase_float(b)}'
+
+
+# =============================================================================
+# Material property extraction (Blender 4.x node-based)
+# =============================================================================
+
 def find_principled(mat):
-    if mat.node_tree:
+    """Find the Principled BSDF node in a material's node tree."""
+    if mat and mat.node_tree:
         for node in mat.node_tree.nodes:
             if node.type == 'BSDF_PRINCIPLED':
                 return node
     return None
+
 
 def get_diffuse_color(mat):
     principled = find_principled(mat)
     if principled:
         col = principled.inputs['Base Color'].default_value
         return (col[0], col[1], col[2])
-    return (0.8, 0.8, 0.8)  # default
+    return (0.8, 0.8, 0.8)
+
 
 def get_specular_color(mat):
     principled = find_principled(mat)
     if principled:
         spec = principled.inputs['Specular IOR Level'].default_value
         return (spec, spec, spec)
-    return (1.0, 1.0, 1.0)  # default
+    return (1.0, 1.0, 1.0)
+
 
 def get_shine(mat):
     principled = find_principled(mat)
     if principled:
         roughness = principled.inputs['Roughness'].default_value
-        return aseFloat((1 - roughness) ** 2)  # approximate
-    return aseFloat(0.1)
+        return (1.0 - roughness) ** 2
+    return 0.1
+
 
 def get_shine_strength(mat):
     principled = find_principled(mat)
     if principled:
-        return aseFloat(principled.inputs['Specular IOR Level'].default_value)
-    return aseFloat(1.0)
+        return principled.inputs['Specular IOR Level'].default_value
+    return 1.0
+
 
 def get_transparency(mat):
     principled = find_principled(mat)
     if principled:
-        return aseFloat(1.0 - principled.inputs['Alpha'].default_value)
-    return aseFloat(0.0)
+        return 1.0 - principled.inputs['Alpha'].default_value
+    return 0.0
 
-def get_emit(mat):
+
+def get_selfillum(mat):
     principled = find_principled(mat)
     if principled:
-        return aseFloat(principled.inputs['Emission Strength'].default_value)
-    return aseFloat(0.0)
+        return principled.inputs['Emission Strength'].default_value
+    return 0.0
 
-def get_bitmap(mat):
-    principled = find_principled(mat)
-    if principled:
-        inp = principled.inputs['Base Color']
-        if inp.links:
-            from_node = inp.links[0].from_node
-            if from_node.type == 'TEX_IMAGE' and from_node.image:
-                filepath = bpy.path.abspath(from_node.image.filepath)
-                return '\\\\base\\' + filepath.replace('/', '\\')
+
+def get_bitmap_path(mat):
+    """Get the diffuse texture path from the material's node tree.
+
+    Returns the material name as the bitmap path (idTech 4 convention:
+    material name IS the texture/shader path). Falls back to 'None'."""
+    if mat:
+        return '\\\\base\\' + mat.name.replace('/', '\\')
     return 'None'
 
-#== Error ==================================================================
-class Error(Exception):
 
-    def __init__(self, message):
-        self.message = message
-        print('\n\n' + message + '\n\n')
+# =============================================================================
+# Smoothing group computation (non-destructive, bmesh-based)
+# =============================================================================
 
-#== Header =================================================================
-class cHeader:
-    def __init__(self):
-        self.comment = "Ascii Scene Exporter v2.51"
+def compute_smoothing_groups(bm):
+    """Compute smoothing groups from sharp edges using flood-fill on a bmesh.
 
-    def __repr__(self):
-        return '''*3DSMAX_ASCIIEXPORT\t200\n*COMMENT "{0}"\n'''.format(self.comment)
+    Faces connected through non-sharp edges belong to the same smoothing group.
+    Returns a dict mapping face index -> smoothing group ID (1-based, mod 32).
+    """
+    bm.faces.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
 
-#== Scene ==================================================================
-class cScene:
-    def __init__(self):
-        self.filename = bpy.data.filepath
-        self.firstframe = 0
-        self.lastframe = 100
-        self.framespeed = 30
-        self.ticksperframe = 160
-        self.backgroundstatic = ''.join([aseFloat(x) for x in [0.0, 0.0, 0.0]])
-        self.ambientstatic = ''.join([aseFloat(x) for x in [0.0, 0.0, 0.0]])
+    visited = set()
+    groups = {}
+    group_id = 0
 
-    def __repr__(self):
-        return '''*SCENE {{\n\t*SCENE_FILENAME "{0}"\
-               \n\t*SCENE_FIRSTFRAME {1}\
-               \n\t*SCENE_LASTFRAME {2}\
-               \n\t*SCENE_FRAMESPEED {3}\
-               \n\t*SCENE_TICKSPERFRAME {4}\
-               \n\t*SCENE_BACKGROUND_STATIC {5}\
-               \n\t*SCENE_AMBIENT_STATIC {6}\
-               \n}}\n'''.format(self.filename, self.firstframe, self.lastframe, self.framespeed, self.ticksperframe, self.backgroundstatic, self.ambientstatic)
+    for face in bm.faces:
+        if face.index in visited:
+            continue
 
-#== Materials ==============================================================
-class cMaterials:
-    def __init__(self):
-        global optionSubmaterials
-        global matList
-        global numMats
-
-        self.material_list = []
-
-        # Get all of the materials used by non-collision object meshes  
-        for object in bpy.context.selected_objects:
-            if collisionObject(object) == True:
+        # Flood fill from this face across non-sharp edges
+        group_id += 1
+        stack = [face]
+        while stack:
+            f = stack.pop()
+            if f.index in visited:
                 continue
-            elif object.type != 'MESH':
-                continue
-            else:
-                print(object.name + ': Constructing Materials')
-                for slot in object.material_slots:
-                    if slot.material and self.material_list.count(slot.material) == 0:
-                        self.material_list.append(slot.material)
-                        matList.append(slot.material.name)
+            visited.add(f.index)
+            groups[f.index] = group_id
 
-        self.material_count = len(self.material_list)
-        numMats = self.material_count
+            for edge in f.edges:
+                if edge.smooth:  # not sharp
+                    for linked_face in edge.link_faces:
+                        if linked_face.index not in visited:
+                            stack.append(linked_face)
 
-        if self.material_count == 0:
-            raise Error('Mesh must have at least one applied material')
-        else:
-            if optionSubmaterials:
-                self.dump = cSubMaterials(self.material_list)
-            else:
-                self.dump = cMultiMaterials(self.material_list)
+    return groups
 
-    def __repr__(self):
-        return str(self.dump)
 
-class cMultiMaterials:
-    def __init__(self, material_list):
-        self.numMtls = len(material_list)
-        self.dump = '''*MATERIAL_LIST {{\
-                    \n\t*MATERIAL_COUNT {0}\
-                    '''.format(str(self.numMtls))
+def mesh_needs_smoothing_groups(obj):
+    """Determine if a mesh needs smoothing groups exported.
 
-        for index, slot in enumerate(material_list):
-            self.dump += '''\n\t*MATERIAL {0} {{\
-                            {1}\
-                            \n\t}}'''.format(index, cMaterial(slot))
+    Returns True if the mesh has any sharp edges, flat-shaded faces,
+    auto-smooth enabled, or relevant modifiers (Smooth by Angle, Edge Split).
+    Returns False if all faces are smooth-shaded with no sharp edges.
+    """
+    mesh = obj.data
 
-        self.dump += '\n}'
-
-    def __repr__(self):
-        return self.dump
-
-class cSubMaterials:
-    def __init__(self, material_list):
-        slot = material_list[0]
-        self.dump = '''*MATERIAL_LIST {\
-                    \n\t*MATERIAL_COUNT 1\
-                    \n\t*MATERIAL 0 {\
-                    '''
-        self.matDump = ''
-        self.name = material_list[0].name
-        self.numSubMtls = len(material_list)
-        self.diffusemap = cDiffusemap(slot)
-        if self.numSubMtls > 1:
-            self.matClass = 'Multi/Sub-Object'
-            self.diffuseDump = ''
-        else:
-            self.matClass = 'Standard'
-            self.numSubMtls = 0
-            self.diffuseDump = self.diffdump()
-        self.ambient = ''.join([aseFloat(x) for x in [0.0, 0.0, 0.0]])
-        self.diffuse = ''.join([aseFloat(x) for x in get_diffuse_color(slot)])
-        self.specular = ''.join([aseFloat(x) for x in get_specular_color(slot)])
-        self.shine = get_shine(slot)
-        self.shinestrength = get_shine_strength(slot)
-        self.transparency = get_transparency(slot)
-        self.wiresize = aseFloat(1.0)
-        self.shading = 'Phong'
-        self.xpfalloff = aseFloat(0.0)
-        self.xptype = 'Filter'
-        self.falloff = 'In'
-        self.soften = False
-        self.submtls = []
-        self.selfillum = get_emit(slot)
-
-        if len(material_list) > 1:
-            for index, slot in enumerate(material_list):
-                self.matDump += '''\n\t\t*SUBMATERIAL {0} {{\
-                                {1}\
-                                \n\t\t}}'''.format(index, cMaterial(slot))
-
-        self.dump += '''\n\t\t*MATERIAL_NAME "{0}"\
-                       \n\t\t*MATERIAL_CLASS "{1}"\
-                       \n\t\t*MATERIAL_AMBIENT {2}\
-                       \n\t\t*MATERIAL_DIFFUSE {3}\
-                       \n\t\t*MATERIAL_SPECULAR {4}\
-                       \n\t\t*MATERIAL_SHINE {5}\
-                       \n\t\t*MATERIAL_SHINESTRENGTH {6}\
-                       \n\t\t*MATERIAL_TRANSPARENCY {7}\
-                       \n\t\t*MATERIAL_WIRESIZE {8}\
-                       \n\t\t*MATERIAL_SHADING {9}\
-                       \n\t\t*MATERIAL_XP_FALLOFF {10}\
-                       \n\t\t*MATERIAL_SELFILLUM {11}\
-                       \n\t\t*MATERIAL_FALLOFF {12}\
-                       \n\t\t*MATERIAL_XP_TYPE {13}\
-                       {14}\
-                       \n\t\t*NUMSUBMTLS {15}\
-                       {16}'''.format(self.name, self.matClass, self.ambient, self.diffuse, self.specular, self.shine, self.shinestrength, self.transparency, self.wiresize, self.shading, self.xpfalloff, self.selfillum, self.falloff, self.xptype, self.diffuseDump, self.numSubMtls, self.matDump)
-
-        self.dump += '\n\t}\n}'
-
-    def diffdump(self):
-        return str(self.diffusemap)
-
-    def __repr__(self):
-        return self.dump
-
-class cMaterial:
-    def __init__(self, slot):
-        self.dump = ''
-        self.name = slot.name
-        self.matClass = 'Standard'
-        self.ambient = ''.join([aseFloat(x) for x in [0.0, 0.0, 0.0]])
-        self.diffuse = ''.join([aseFloat(x) for x in get_diffuse_color(slot)])
-        self.specular = ''.join([aseFloat(x) for x in get_specular_color(slot)])
-        self.shine = get_shine(slot)
-        self.shinestrength = get_shine_strength(slot)
-        self.transparency = get_transparency(slot)
-        self.wiresize = aseFloat(1.0)
-        self.shading = 'Phong'
-        self.xpfalloff = aseFloat(0.0)
-        self.xptype = 'Filter'
-        self.falloff = 'In'
-        self.soften = False
-        self.diffusemap = cDiffusemap(slot)
-        self.submtls = []
-        self.selfillum = get_emit(slot)
-        self.dump = '''\n\t\t*MATERIAL_NAME "{0}"\
-                       \n\t\t*MATERIAL_CLASS "{1}"\
-                       \n\t\t*MATERIAL_AMBIENT {2}\
-                       \n\t\t*MATERIAL_DIFFUSE {3}\
-                       \n\t\t*MATERIAL_SPECULAR {4}\
-                       \n\t\t*MATERIAL_SHINE {5}\
-                       \n\t\t*MATERIAL_SHINESTRENGTH {6}\
-                       \n\t\t*MATERIAL_TRANSPARENCY {7}\
-                       \n\t\t*MATERIAL_WIRESIZE {8}\
-                       \n\t\t*MATERIAL_SHADING {9}\
-                       \n\t\t*MATERIAL_XP_FALLOFF {10}\
-                       \n\t\t*MATERIAL_SELFILLUM {11}\
-                       \n\t\t*MATERIAL_FALLOFF {12}\
-                       \n\t\t*MATERIAL_XP_TYPE {13}\
-                       {14}\
-                       '''.format(self.name, self.matClass, self.ambient, self.diffuse, self.specular, self.shine, self.shinestrength, self.transparency, self.wiresize, self.shading, self.xpfalloff, self.selfillum, self.falloff, self.xptype, self.diffdump())
-
-    def diffdump(self):
-        return str(self.diffusemap)
-
-    def __repr__(self):
-        return self.dump
-
-class cDiffusemap:
-    def __init__(self, slot):
-        self.dump = ''
-        if slot is None:
-            self.name = 'default'
-            self.mapclass = 'Bitmap'
-            self.bitmap = 'None'
-        else:
-            self.name = slot.name
-            self.mapclass = 'Bitmap'
-            self.bitmap = '\\\\base\\' + slot.name.replace('/', '\\')
-        self.subno = 1
-        self.amount = aseFloat(1.0)
-        self.type = 'Screen'
-        self.uoffset = aseFloat(0.0)
-        self.voffset = aseFloat(0.0)
-        self.utiling = aseFloat(1.0)
-        self.vtiling = aseFloat(1.0)
-        self.angle = aseFloat(0.0)
-        self.blur = aseFloat(1.0)
-        self.bluroffset = aseFloat(0.0)
-        self.noiseamt = aseFloat(1.0)
-        self.noisesize = aseFloat(1.0)
-        self.noiselevel = 1
-        self.noisephase = aseFloat(0.0)
-        self.bitmapfilter = 'Pyramidal'
-
-        self.dump = '''\n\t\t*MAP_DIFFUSE {{\
-                       \n\t\t\t*MAP_NAME "{0}"\
-                       \n\t\t\t*MAP_CLASS "{1}"\
-                       \n\t\t\t*MAP_SUBNO {2}\
-                       \n\t\t\t*MAP_AMOUNT {3}\
-                       \n\t\t\t*BITMAP "{4}"\
-                       \n\t\t\t*MAP_TYPE {5}\
-                       \n\t\t\t*UVW_U_OFFSET {6}\
-                       \n\t\t\t*UVW_V_OFFSET {7}\
-                       \n\t\t\t*UVW_U_TILING {8}\
-                       \n\t\t\t*UVW_V_TILING {9}\
-                       \n\t\t\t*UVW_ANGLE {10}\
-                       \n\t\t\t*UVW_BLUR {11}\
-                       \n\t\t\t*UVW_BLUR_OFFSET {12}\
-                       \n\t\t\t*UVW_NOUSE_AMT {13}\
-                       \n\t\t\t*UVW_NOISE_SIZE {14}\
-                       \n\t\t\t*UVW_NOISE_LEVEL {15}\
-                       \n\t\t\t*UVW_NOISE_PHASE {16}\
-                       \n\t\t\t*BITMAP_FILTER {17}\
-                       \n\t\t}}\
-                       '''.format(self.name, self.mapclass, self.subno, self.amount, self.bitmap, self.type, self.uoffset, self.voffset, self.utiling, self.vtiling, self.angle, self.blur, self.bluroffset, self.noiseamt, self.noisesize, self.noiselevel, self.noisephase, self.bitmapfilter)
-
-    def __repr__(self):
-        return self.dump
-
-#== Geometry ===============================================================
-class cGeomObject:
-    def __init__(self, object):
-        print(object.name + ": Constructing Geometry")
-        global optionAllowMultiMats
-        global currentMatId
-
-        self.name = object.name
-        self.prop_motionblur = 0
-        self.prop_castshadow = 1
-        self.prop_recvshadow = 1
-
-        if optionAllowMultiMats:
-            self.material_ref = 0
-        else:
-            self.material_ref = matList.index(object.material_slots[object.data.polygons[0].material_index].material.name)
-
-        self.nodetm = cNodeTM(object)
-        self.mesh = cMesh(object)
-
-        self.dump = '''\n*GEOMOBJECT {{\n\t*NODE_NAME "{0}"\n{1}\n{2}\n\t*PROP_MOTIONBLUR {3}\n\t*PROP_CASTSHADOW {4}\n\t*PROP_RECVSHADOW {5}\n\t*MATERIAL_REF {6}\n}}'''.format(self.name, self.nodetm, self.mesh, self.prop_motionblur, self.prop_castshadow, self.prop_recvshadow, self.material_ref)
-
-    def __repr__(self):
-        return self.dump
-
-class cNodeTM:
-    def __init__(self, object):
-        self.name = object.name
-        self.inherit_pos = '0 0 0'
-        self.inherit_rot = '0 0 0'
-        self.inherit_scl = '0 0 0'
-        self.tm_row0 = '1.0000 0.0000 0.0000'
-        self.tm_row1 = '0.0000 1.0000 0.0000'
-        self.tm_row2 = '0.0000 0.0000 1.0000'
-        self.tm_row3 = '0.0000 0.0000 0.0000'
-        self.tm_pos = '0.0000 0.0000 0.0000'
-        self.tm_rotaxis = '0.0000 0.0000 0.0000'
-        self.tm_rotangle = '0.0000'
-        self.tm_scale = '1.0000 1.0000 1.0000'
-        self.tm_scaleaxis = '0.0000 0.0000 0.0000'
-        self.tm_scaleaxisang = '0.0000'
-
-        self.dump = '''\t*NODE_TM {{\
-                       \n\t\t*NODE_NAME "{0}"\
-                       \n\t\t*INHERIT_POS {1}\
-                       \n\t\t*INHERIT_ROT {2}\
-                       \n\t\t*INHERIT_SCL {3}\
-                       \n\t\t*TM_ROW0 {4}\
-                       \n\t\t*TM_ROW1 {5}\
-                       \n\t\t*TM_ROW2 {6}\
-                       \n\t\t*TM_ROW3 {7}\
-                       \n\t\t*TM_POS {8}\
-                       \n\t\t*TM_ROTAXIS {9}\
-                       \n\t\t*TM_ROTANGLE {10}\
-                       \n\t\t*TM_SCALE {11}\
-                       \n\t\t*TM_SCALEAXIS {12}\
-                       \n\t\t*TM_SCALEAXISANG {13}\
-                       \n\t}}'''.format(self.name, self.inherit_pos, self.inherit_rot, self.inherit_scl, self.tm_row0, self.tm_row1, self.tm_row2, self.tm_row3, self.tm_pos, self.tm_rotaxis, self.tm_rotangle, self.tm_scale, self.tm_scaleaxis, self.tm_scaleaxisang)
-
-    def __repr__(self):
-        return self.dump
-
-class cMesh:
-    def __init__(self, object):
-        if collisionObject(object) == False:
-            self.tvertlist = cTVertlist(object)
-            self.numtvertex = self.tvertlist.length
-            self.numtvfaces = len(object.data.polygons)
-            self.tfacelist = cTFacelist(self.numtvfaces)
-            self.uvmapchannels = self.uvdump(object)
-
-            self.tvertlist_str = '\n\t\t*MESH_TVERTLIST ' + str(self.tvertlist)
-            self.numtvertex_str = '\n\t\t*MESH_NUMTVERTEX ' + str(self.numtvertex)
-            self.numtvfaces_str = '\n\t\t*MESH_NUMTVFACES ' + str(self.numtvfaces)
-            self.tfacelist_str = '\n\t\t*MESH_TFACELIST ' + str(self.tfacelist)
-        else:
-            self.tvertlist_str = ''
-            self.numtvertex_str = ''
-            self.numtvfaces_str = ''
-            self.tfacelist_str = ''
-            self.uvmapchannels = ''
-
-        self.timevalue = '0'
-        self.numvertex = len(object.data.vertices)
-        self.numfaces = len(object.data.polygons)
-        self.vertlist = cVertlist(object)
-        self.facelist = cFacelist(object)
-
-        if len(object.data.vertex_colors) > 0:
-            self.cvertlist = cCVertlist(object)
-            self.numcvertex = self.cvertlist.length
-            self.numcvfaces = len(object.data.polygons)
-            self.cfacelist = cCFacelist(self.numcvfaces)
-            self.cvertlist = '\n{0}'.format(self.cvertlist)
-            self.numcvertex = '\n\t\t*MESH_NUMCVERTEX {0}'.format(self.numcvertex)
-            self.numcvfaces = '\n\t\t*MESH_NUMCVFACES {0}'.format(self.numcvfaces)
-            self.cfacelist = '\n{0}'.format(self.cfacelist)
-        else:
-            self.cvertlist = ''
-            self.numcvertex = ''
-            self.numcvfaces = ''
-            self.cfacelist = ''
-
-        self.normals = cNormallist(object)
-
-    def getUVLayerNames(self, object):
-        self.uvLayerNames = [uv.name for uv in object.data.uv_layers]
-
-    def uvdump(self, object):
-        self.mappingchannels = ''
-        if collisionObject(object) == False:
-            self.getUVLayerNames(object)
-            if len(self.uvLayerNames) > 1:
-                active_uv = object.data.uv_layers.active_index
-                obj = object.data
-                activeUV = 0
-                for uvname in self.uvLayerNames:
-                    if activeUV == 0:
-                        activeUV += 1
-                        continue
-                    obj.uv_layers.active_index = activeUV
-                    self.uvm_tvertlist = cTVertlist(object)
-                    self.uvm_numtvertex = self.uvm_tvertlist.length
-                    self.uvm_numtvfaces = len(object.data.polygons)
-                    self.uvm_tfacelist = cTFacelist(self.uvm_numtvfaces)
-                    self.uvm_numcvertex = ''
-                    self.uvm_numcvfaces = ''
-                    self.uvm_cvertlist = ''
-                    self.uvm_cfacelist = ''
-                    self.mappingchannels += '''\n\t\t*MESH_MAPPINGCHANNEL {0} {{\n\t\t\t*MESH_NUMTVERTEX {1}\n\t\t\t*MESH_TVERTLIST {2}\n\t\t*MESH_NUMTVFACES {3}\n\t\t*MESH_TFACELIST {4}{5}{6}{7}{8}\n\t\t}}'''.format(str(activeUV + 1), self.uvm_numtvertex, self.uvm_tvertlist, self.uvm_numtvfaces, self.uvm_tfacelist, self.uvm_numcvertex, self.uvm_cvertlist, self.uvm_numcvfaces, self.uvm_cfacelist)
-                    activeUV += 1
-                object.data.uv_layers.active_index = active_uv
-        return self.mappingchannels
-
-    def __repr__(self):
-        temp = '''\t*MESH {{\n\t\t*TIMEVALUE {0}\n\t\t*MESH_NUMVERTEX {1}\n\t\t*MESH_NUMFACES {2}\n\t\t*MESH_VERTEX_LIST {3}\n\t\t*MESH_FACE_LIST {4}{5}{6}{7}{8}{9}{10}{11}{12}{13}\n{14}\n\t}}'''.format(self.timevalue, self.numvertex, self.numfaces, self.vertlist, self.facelist, self.numtvertex_str, self.tvertlist_str, self.numtvfaces_str, self.tfacelist_str, self.numcvertex, self.cvertlist, self.numcvfaces, self.cfacelist, self.uvmapchannels, self.normals)
-        return temp
-
-class cVertlist:
-    def __init__(self, object):
-        self.vertlist = []
-        for data in object.data.vertices:
-            temp = cVert(data.index, data.co.to_tuple(4))
-            self.vertlist.append(temp)
-
-    def dump(self):
-        temp = ''
-        for x in self.vertlist:
-            temp += str(x)
-        return temp
-
-    def __repr__(self):
-        return '''{{\n{0}\t\t}}'''.format(self.dump())
-
-class cVert:
-    def __init__(self, index, coord):
-        global optionScale
-        self.index = index
-        self.x = aseFloat(coord[0] * optionScale)
-        self.y = aseFloat(coord[1] * optionScale)
-        self.z = aseFloat(coord[2] * optionScale)
-
-    def __repr__(self):
-        return '''\t\t\t*MESH_VERTEX {0} {1} {2} {3}\n'''.format(self.index, self.x, self.y, self.z)
-
-class cFacelist:
-    def __init__(self, object):
-        global optionAllowMultiMats
-        global matList
-        global numMats
-        global currentMatId
-
-        self.facelist = []
-        sgID = 0
-
-        if collisionObject(object) == False:
-            if optionSmoothingGroups:
-                self.smoothing_groups = defineSmoothing(self, object)
-            else:
-                self.smoothing_groups = ''
-
-        for face in object.data.polygons:
-            if len(face.vertices) != 3:
-                raise Error("Mesh must be triangulated")
-            if optionAllowMultiMats:
-                if collisionObject(object) == False:
-                    self.matid = matList.index(object.material_slots[face.material_index].material.name)
-                else:
-                    self.matid = 0
-            else:
-                self.matid = currentMatId
-            if collisionObject(object) == False:
-                if optionSmoothingGroups:
-                    for group in self.smoothing_groups:
-                        if group.count(face.index) == 0:
-                            continue
-                        else:
-                            index = self.smoothing_groups.index(group)
-                            sgID = index % 32
-
-            temp = '''\t\t\t*MESH_FACE {0}: A: {1} B: {2} C: {3} AB: 0 BC: 0 CA: 0 *MESH_SMOOTHING {4} *MESH_MTLID {5}\n'''.format(face.index, face.vertices[0], face.vertices[1], face.vertices[2], sgID, self.matid)
-            self.facelist.append(temp)
-
-    def dump(self):
-        temp = ''
-        for x in self.facelist:
-            temp += x
-        return temp
-
-    def __repr__(self):
-        return '''{{\n{0}\t\t}}'''.format(self.dump())
-
-class cTVertlist:
-    def __init__(self, object):
-        self.vertlist = []
-        mesh = object.data
-        uv_layer = mesh.uv_layers.active
-        if uv_layer is None:
-            raise Error("Error: No UV texture data for " + object.name)
-        index = 0
-        for poly in mesh.polygons:
-            if len(poly.loop_indices) != 3:
-                raise Error("Mesh must be triangulated")
-            for i in range(3):
-                loop_idx = poly.loop_indices[i]
-                uv = uv_layer.data[loop_idx].uv
-                temp = cTVert(index, (uv.x, uv.y))
-                self.vertlist.append(temp)
-                index += 1
-        self.length = index
-
-    def dump(self):
-        temp = ''
-        for x in self.vertlist:
-            temp += str(x)
-        return temp
-
-    def __repr__(self):
-        return '''{{\n{0}\t\t}}'''.format(self.dump())
-
-class cTVert:
-    def __init__(self, index, coord):
-        self.index = index
-        self.u = aseFloat(coord[0])
-        self.v = aseFloat(coord[1])
-
-    def __repr__(self):
-        return '''\t\t\t*MESH_TVERT {0} {1} {2} 0.0000\n'''.format(self.index, self.u, self.v)
-
-class cTFacelist:
-    def __init__(self, facecount):
-        self.facelist = []
-        for data in range(facecount):
-            temp = cTFace(data)
-            self.facelist.append(temp)
-
-    def dump(self):
-        temp = ''
-        for x in self.facelist:
-            temp += str(x)
-        return temp
-
-    def __repr__(self):
-        return '''{{\n{0}\t\t}}'''.format(self.dump())
-
-class cTFace:
-    def __init__(self, x):
-        self.index = x
-        self.vertices = [x * 3, (x * 3) + 1, (x * 3) + 2]
-
-    def __repr__(self):
-        return '''\t\t\t*MESH_TFACE {0} {1} {2} {3}\n'''.format(self.index, self.vertices[0], self.vertices[1], self.vertices[2])
-
-class cCVertlist:
-    def __init__(self, object):
-        self.vertlist = []
-        self.index = 0
-        mesh = object.data
-        vc_layer = mesh.vertex_colors.active
-        if vc_layer:
-            for poly in mesh.polygons:
-                if len(poly.loop_indices) != 3:
-                    raise Error("Mesh must be triangulated")
-                for i in range(3):
-                    loop_idx = poly.loop_indices[i]
-                    color = vc_layer.data[loop_idx].color
-                    self.vertlist.append(cCVert(self.index, (color[0], color[1], color[2])))
-                    self.index += 1  # Fixed increment to 1 instead of 3
-        self.length = len(self.vertlist)
-
-    def dump(self):
-        temp = ''
-        for x in self.vertlist:
-            temp += str(x)
-        return temp
-
-    def __repr__(self):
-        return '''\t\t*MESH_CVERTLIST {{\n{0}\t\t}}'''.format(self.dump())
-
-class cCVert:
-    def __init__(self, index, temp):
-        self.index = index
-        self.r = aseFloat(float(temp[0]))
-        self.g = aseFloat(float(temp[1]))
-        self.b = aseFloat(float(temp[2]))
-
-    def __repr__(self):
-        return '''\t\t\t*MESH_VERTCOL {0} {1} {2} {3}\n'''.format(self.index, self.r, self.g, self.b)
-
-class cCFacelist:
-    def __init__(self, facecount):
-        self.facelist = [cCFace(index, 0) for index in range(facecount)]
-
-    def dump(self):
-        temp = ''
-        for x in self.facelist:
-            temp += str(x)
-        return temp
-
-    def __repr__(self):
-        return '''\t\t*MESH_CFACELIST {{\n{0}\t\t}}'''.format(self.dump())
-
-class cCFace:
-    def __init__(self, index, data):
-        self.index = index
-        self.vertices = [index * 3, (index * 3) + 1, (index * 3) + 2]
-
-    def __repr__(self):
-        return '''\t\t\t*MESH_CFACE {0} {1} {2} {3}\n'''.format(self.index, self.vertices[0], self.vertices[1], self.vertices[2])
-
-class cNormallist:
-    def __init__(self, object):
-        self.normallist = [cNormal(face, object) for face in object.data.polygons]
-
-    def dump(self):
-        temp = ''
-        for x in self.normallist:
-            temp += str(x)
-        return temp
-
-    def __repr__(self):
-        return '''\t\t*MESH_NORMALS {{\n{0}\t\t}}'''.format(self.dump())
-
-class cNormal:
-    def __init__(self, face, object):
-        self.faceindex = face.index
-        self.facenormal = [aseFloat(x) for x in face.normal.to_tuple(4)]
-        self.vertnormals = []
-        for x in face.vertices:
-            self.vertnormals.append([x, [aseFloat(y) for y in object.data.vertices[x].normal.to_tuple(4)]])
-
-    def __repr__(self):
-        return '''\t\t\t*MESH_FACENORMAL {0} {1} {2} {3}\n\t\t\t\t*MESH_VERTEXNORMAL {4} {5} {6} {7}\n\t\t\t\t*MESH_VERTEXNORMAL {8} {9} {10} {11}\n\t\t\t\t*MESH_VERTEXNORMAL {12} {13} {14} {15}\n'''.format(self.faceindex, self.facenormal[0], self.facenormal[1], self.facenormal[2], self.vertnormals[0][0], self.vertnormals[0][1][0], self.vertnormals[0][1][1], self.vertnormals[0][1][2], self.vertnormals[1][0], self.vertnormals[1][1][0], self.vertnormals[1][1][1], self.vertnormals[1][1][2], self.vertnormals[2][0], self.vertnormals[2][1][0], self.vertnormals[2][1][1], self.vertnormals[2][1][2])
-
-#== Smoothing Groups and Helper Methods =================================
-def defineSmoothing(self, object):
-    print(object.name + ": Constructing Smoothing Groups")
-
-    seam_edge_list = []
-    sharp_edge_list = []
-
-    _mode = bpy.context.active_object.mode
-    bpy.ops.object.mode_set(mode='EDIT')
-    bpy.ops.mesh.select_all(action='DESELECT')
-    setSelMode('EDGE')
-
-    bm = bmesh.from_edit_mesh(object.data)
-    for edge in bm.edges:
-        if edge.seam:
-            seam_edge_list.append(edge.index)
-            edge.select = True
-
-    bpy.ops.mesh.select_all(action='SELECT')
-    bpy.ops.mesh.mark_seam(clear=True)
-
-    bpy.ops.mesh.select_all(action='DESELECT')
-    for edge in bm.edges:
-        if edge.smooth == False:  # sharp
-            sharp_edge_list.append(edge)
-            edge.select = True
-
-    bpy.ops.mesh.mark_seam()
-
-    bpy.ops.mesh.select_all(action='DESELECT')
-
-    smoothing_groups = []
-    face_list = [f.index for f in bm.faces]
-
-    setSelMode('FACE')
-
-    while len(face_list) > 0:
-        face_idx = face_list[0]
-        bm.faces[face_idx].select = True
-        bpy.ops.mesh.select_linked()
-
-        selected_faces = [f.index for f in bm.faces if f.select]
-        smoothing_groups.append(selected_faces)
-        for face_index in selected_faces:
-            if face_index in face_list:
-                face_list.remove(face_index)
-        for f in bm.faces:
-            f.select = False
-
-    bpy.ops.mesh.select_all(action='DESELECT')
-    for edge_idx in seam_edge_list:
-        bm.edges[edge_idx].select = True
-    bpy.ops.mesh.mark_seam()
-
-    bmesh.update_edit_mesh(object.data)
-    bpy.ops.object.mode_set(mode=_mode)
-    print('\t' + str(len(smoothing_groups)) + ' smoothing groups found.')
-    return smoothing_groups
-
-#===========================================================================
-# // General Helpers
-#===========================================================================
-
-def collisionObject(object):
-    collisionPrefixes = ['UCX_', 'UBX_', 'USX_']
-    for prefix in collisionPrefixes:
-        if object.name.startswith(prefix):
+    # Check for flat-shaded faces
+    for poly in mesh.polygons:
+        if not poly.use_smooth:
             return True
+
+    # Check for sharp edges
+    for edge in mesh.edges:
+        if not edge.smooth:
+            return True
+
+    # Check for auto-smooth (Blender 4.x: attribute-based)
+    if hasattr(mesh, 'has_custom_normals') and mesh.has_custom_normals:
+        return True
+
+    # Check for Edge Split or Smooth by Angle modifiers
+    for mod in obj.modifiers:
+        if mod.type in ('EDGE_SPLIT', 'NODES'):
+            # NODES could be "Smooth by Angle" geometry nodes modifier
+            if mod.type == 'NODES' and mod.node_group:
+                if 'smooth' in mod.node_group.name.lower():
+                    return True
+            else:
+                return True
+
     return False
 
-def setSelMode(mode, default=True):
-    if default:
-        if mode == 'VERT':
-            bpy.context.tool_settings.mesh_select_mode = (True, False, False)
-        elif mode == 'EDGE':
-            bpy.context.tool_settings.mesh_select_mode = (False, True, False)
-        elif mode == 'FACE':
-            bpy.context.tool_settings.mesh_select_mode = (False, False, True)
-    else:
-        bpy.context.tool_settings.mesh_select_mode = mode
 
-def getSelMode(self, default=True):
-    if default:
-        modes = bpy.context.tool_settings.mesh_select_mode
-        if modes[0]: return 'VERT'
-        if modes[1]: return 'EDGE'
-        if modes[2]: return 'FACE'
-        return False
-    else:
-        return list(bpy.context.tool_settings.mesh_select_mode)
+# =============================================================================
+# ASE data building (string assembly using lists for performance)
+# =============================================================================
 
-#== Core ===================================================================
+class ASEBuilder:
+    """Builds complete ASE file content from Blender scene data.
 
-from bpy_extras.io_utils import ExportHelper
-from bpy.props import StringProperty, BoolProperty, FloatProperty
+    All mesh operations are non-destructive: we work on evaluated copies
+    obtained via depsgraph, never modifying the original objects.
+    """
 
-class ExportAse(bpy.types.Operator, ExportHelper):
-    '''Load an Ascii Scene Export File'''
-    bl_idname = "export.ase"
-    bl_label = "Export"
-    __doc__ = "Ascii Scene Exporter (.ase)"
+    def __init__(self, context, options):
+        self.context = context
+        self.options = options
+        self.material_list = []  # ordered list of unique materials
+        self.mat_name_to_index = {}  # material name -> index in material_list
+
+    def build(self, objects):
+        """Build complete ASE content for the given mesh objects.
+
+        Returns a string containing the full ASE file.
+        """
+        # Collect all unique materials from all selected mesh objects
+        self._collect_materials(objects)
+
+        parts = []
+        parts.append(self._build_header())
+        parts.append(self._build_scene())
+        parts.append(self._build_materials())
+
+        for obj in objects:
+            parts.append(self._build_geomobject(obj))
+
+        return ''.join(parts)
+
+    def build_split(self, obj):
+        """Build separate ASE files for each material on an object.
+
+        Returns a list of (suffix, ase_content) tuples.
+        Vertex colors and normals are preserved per-chunk so that
+        chunks loaded side-by-side appear as a continuous mesh.
+        """
+        self._collect_materials([obj])
+
+        results = []
+        mesh, bm = self._get_evaluated_bmesh(obj)
+        xform = self._compute_transform_matrix(obj)
+
+        # Find which material indices are actually used
+        used_mat_indices = sorted(set(f.material_index for f in bm.faces))
+
+        for chunk_idx, mat_idx in enumerate(used_mat_indices):
+            # Clone bmesh and remove faces not belonging to this material
+            bm_chunk = bm.copy()
+            faces_to_remove = [f for f in bm_chunk.faces if f.material_index != mat_idx]
+            for f in faces_to_remove:
+                bm_chunk.faces.remove(f)
+
+            # Clean up: remove orphan verts/edges
+            verts_to_remove = [v for v in bm_chunk.verts if not v.link_faces]
+            for v in verts_to_remove:
+                bm_chunk.verts.remove(v)
+
+            if len(bm_chunk.faces) == 0:
+                bm_chunk.free()
+                continue
+
+            # Convert chunk bmesh to a temporary mesh for export
+            chunk_mesh = bpy.data.meshes.new(f'_ase_chunk_{chunk_idx}')
+            bm_chunk.to_mesh(chunk_mesh)
+            bm_chunk.free()
+
+            # Triangulate chunk if needed (same logic as _get_evaluated_bmesh)
+            apply_mods = self.options.get('apply_modifiers', True)
+            has_tri_mod = any(mod.type == 'TRIANGULATE' for mod in obj.modifiers)
+            if not (apply_mods and has_tri_mod):
+                self._triangulate_mesh(chunk_mesh)
+
+            # Build ASE for this chunk
+            chunk_name = f'{obj.name}_chunk{chunk_idx:03d}'
+            parts = []
+            parts.append(self._build_header())
+            parts.append(self._build_scene())
+
+            # Single material for this chunk
+            if mat_idx < len(obj.material_slots) and obj.material_slots[mat_idx].material:
+                mat = obj.material_slots[mat_idx].material
+                # Find global material index
+                global_mat_idx = self.mat_name_to_index.get(mat.name, 0)
+            else:
+                global_mat_idx = 0
+
+            parts.append(self._build_materials())
+            parts.append(self._build_geomobject_from_mesh(
+                chunk_name, chunk_mesh, obj, global_mat_idx, xform=xform))
+
+            bpy.data.meshes.remove(chunk_mesh)
+
+            suffix = f'_chunk{chunk_idx:03d}'
+            results.append((suffix, ''.join(parts)))
+
+        bm.free()
+        bpy.data.meshes.remove(mesh)
+
+        return results
+
+    # -------------------------------------------------------------------------
+    # Material collection
+    # -------------------------------------------------------------------------
+
+    def _collect_materials(self, objects):
+        """Collect all unique materials from the given objects."""
+        self.material_list = []
+        self.mat_name_to_index = {}
+
+        for obj in objects:
+            if obj.type != 'MESH':
+                continue
+            for slot in obj.material_slots:
+                if slot.material and slot.material.name not in self.mat_name_to_index:
+                    self.mat_name_to_index[slot.material.name] = len(self.material_list)
+                    self.material_list.append(slot.material)
+
+        if not self.material_list:
+            raise RuntimeError('Selected meshes must have at least one material assigned')
+
+    # -------------------------------------------------------------------------
+    # Header & Scene
+    # -------------------------------------------------------------------------
+
+    def _build_header(self):
+        return '*3DSMAX_ASCIIEXPORT\t200\n*COMMENT "ASE Exporter for idTech 4 - Blender"\n'
+
+    def _build_scene(self):
+        filename = bpy.data.filepath or 'untitled.blend'
+        return (
+            f'*SCENE {{\n'
+            f'\t*SCENE_FILENAME "{filename}"\n'
+            f'\t*SCENE_FIRSTFRAME 0\n'
+            f'\t*SCENE_LASTFRAME 100\n'
+            f'\t*SCENE_FRAMESPEED 30\n'
+            f'\t*SCENE_TICKSPERFRAME 160\n'
+            f'\t*SCENE_BACKGROUND_STATIC 0.0000\t0.0000\t0.0000\n'
+            f'\t*SCENE_AMBIENT_STATIC 0.0000\t0.0000\t0.0000\n'
+            f'}}\n'
+        )
+
+    # -------------------------------------------------------------------------
+    # Materials
+    # -------------------------------------------------------------------------
+
+    def _build_materials(self):
+        lines = []
+        count = len(self.material_list)
+        lines.append(f'*MATERIAL_LIST {{\n')
+        lines.append(f'\t*MATERIAL_COUNT {count}\n')
+
+        for idx, mat in enumerate(self.material_list):
+            lines.append(self._build_single_material(idx, mat))
+
+        lines.append(f'}}\n')
+        return ''.join(lines)
+
+    def _build_single_material(self, index, mat):
+        diffuse = get_diffuse_color(mat)
+        specular = get_specular_color(mat)
+        bitmap = get_bitmap_path(mat)
+
+        return (
+            f'\t*MATERIAL {index} {{\n'
+            f'\t\t*MATERIAL_NAME "{mat.name}"\n'
+            f'\t\t*MATERIAL_CLASS "Standard"\n'
+            f'\t\t*MATERIAL_AMBIENT {ase_color(0.0, 0.0, 0.0)}\n'
+            f'\t\t*MATERIAL_DIFFUSE {ase_color(*diffuse)}\n'
+            f'\t\t*MATERIAL_SPECULAR {ase_color(*specular)}\n'
+            f'\t\t*MATERIAL_SHINE {ase_float(get_shine(mat))}\n'
+            f'\t\t*MATERIAL_SHINESTRENGTH {ase_float(get_shine_strength(mat))}\n'
+            f'\t\t*MATERIAL_TRANSPARENCY {ase_float(get_transparency(mat))}\n'
+            f'\t\t*MATERIAL_WIRESIZE {ase_float(1.0)}\n'
+            f'\t\t*MATERIAL_SHADING Phong\n'
+            f'\t\t*MATERIAL_XP_FALLOFF {ase_float(0.0)}\n'
+            f'\t\t*MATERIAL_SELFILLUM {ase_float(get_selfillum(mat))}\n'
+            f'\t\t*MATERIAL_FALLOFF In\n'
+            f'\t\t*MATERIAL_XP_TYPE Filter\n'
+            f'\t\t*MAP_DIFFUSE {{\n'
+            f'\t\t\t*MAP_NAME "{mat.name}"\n'
+            f'\t\t\t*MAP_CLASS "Bitmap"\n'
+            f'\t\t\t*MAP_SUBNO 1\n'
+            f'\t\t\t*MAP_AMOUNT {ase_float(1.0)}\n'
+            f'\t\t\t*BITMAP "{bitmap}"\n'
+            f'\t\t\t*MAP_TYPE Screen\n'
+            f'\t\t\t*UVW_U_OFFSET {ase_float(0.0)}\n'
+            f'\t\t\t*UVW_V_OFFSET {ase_float(0.0)}\n'
+            f'\t\t\t*UVW_U_TILING {ase_float(1.0)}\n'
+            f'\t\t\t*UVW_V_TILING {ase_float(1.0)}\n'
+            f'\t\t\t*UVW_ANGLE {ase_float(0.0)}\n'
+            f'\t\t\t*UVW_BLUR {ase_float(1.0)}\n'
+            f'\t\t\t*UVW_BLUR_OFFSET {ase_float(0.0)}\n'
+            f'\t\t\t*UVW_NOUSE_AMT {ase_float(1.0)}\n'
+            f'\t\t\t*UVW_NOISE_SIZE {ase_float(1.0)}\n'
+            f'\t\t\t*UVW_NOISE_LEVEL 1\n'
+            f'\t\t\t*UVW_NOISE_PHASE {ase_float(0.0)}\n'
+            f'\t\t\t*BITMAP_FILTER Pyramidal\n'
+            f'\t\t}}\n'
+            f'\t}}\n'
+        )
+
+    # -------------------------------------------------------------------------
+    # Geometry object
+    # -------------------------------------------------------------------------
+
+    def _compute_transform_matrix(self, obj):
+        """Compute the transform matrix to bake into vertex positions.
+
+        Builds a matrix from the object's world matrix components based on
+        which transform options are enabled. This is fully non-destructive.
+        """
+        import mathutils
+
+        mat = mathutils.Matrix.Identity(4)
+        loc, rot, scl = obj.matrix_world.decompose()
+
+        if self.options.get('apply_scale', True):
+            mat = mathutils.Matrix.Diagonal((*scl, 1.0)) @ mat
+        if self.options.get('apply_rotation', True):
+            mat = rot.to_matrix().to_4x4() @ mat
+        if self.options.get('apply_location', True):
+            loc_mat = mathutils.Matrix.Translation(loc)
+            mat = loc_mat @ mat
+
+        return mat
+
+    def _get_evaluated_bmesh(self, obj):
+        """Get a triangulated bmesh from the object.
+
+        If apply_modifiers is True:
+          - Uses the evaluated (modifier-applied) mesh via depsgraph.
+          - If a Triangulate modifier is present, its output is already
+            triangulated so no extra triangulation is done.
+          - If no Triangulate modifier exists, auto-triangulates.
+        If apply_modifiers is False:
+          - Uses the raw mesh data (modifiers ignored).
+          - Always triangulates.
+
+        Returns (mesh, bmesh) - caller must free both when done.
+        """
+        apply_mods = self.options.get('apply_modifiers', True)
+
+        if apply_mods:
+            depsgraph = self.context.evaluated_depsgraph_get()
+            obj_eval = obj.evaluated_get(depsgraph)
+            mesh = bpy.data.meshes.new_from_object(obj_eval)
+
+            # Check if a Triangulate modifier was present on the object
+            has_tri_mod = any(
+                mod.type == 'TRIANGULATE' for mod in obj.modifiers)
+
+            if not has_tri_mod:
+                self._triangulate_mesh(mesh)
+        else:
+            # Ignore modifiers: get raw mesh data
+            mesh = bpy.data.meshes.new_from_object(obj)
+            self._triangulate_mesh(mesh)
+
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        bm.faces.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+
+        return mesh, bm
+
+    def _triangulate_mesh(self, mesh):
+        """Triangulate a mesh in-place using bmesh."""
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        bmesh.ops.triangulate(bm, faces=bm.faces[:])
+        bm.to_mesh(mesh)
+        bm.free()
+
+    def _build_geomobject(self, obj):
+        """Build GEOMOBJECT block(s) for a Blender object.
+
+        idTech 4 resolves materials per-GEOMOBJECT via MATERIAL_REF.
+        MESH_MTLID is ignored by the engine parser. Therefore, if an
+        object has multiple materials, we must split it into separate
+        GEOMOBJECTs — one per material — each with its own MATERIAL_REF.
+
+        Returns a string containing one or more GEOMOBJECT blocks.
+        """
+        mesh, bm = self._get_evaluated_bmesh(obj)
+        xform = self._compute_transform_matrix(obj)
+
+        # Determine which material indices are actually used by faces
+        used_mat_indices = sorted(set(f.material_index for f in bm.faces))
+
+        # Single material (or no material variation): export as one GEOMOBJECT
+        if len(used_mat_indices) <= 1:
+            mat_idx = used_mat_indices[0] if used_mat_indices else 0
+            mat_ref = 0
+            if mat_idx < len(obj.material_slots) and obj.material_slots[mat_idx].material:
+                mat_name = obj.material_slots[mat_idx].material.name
+                mat_ref = self.mat_name_to_index.get(mat_name, 0)
+
+            result = self._build_geomobject_from_data(
+                obj.name, mesh, bm, obj, mat_ref, xform=xform)
+            bm.free()
+            bpy.data.meshes.remove(mesh)
+            return result
+
+        # Multiple materials: split into separate GEOMOBJECTs
+        results = []
+        for mat_idx in used_mat_indices:
+            # Determine the global material index for MATERIAL_REF
+            mat_ref = 0
+            geom_name = obj.name
+            if mat_idx < len(obj.material_slots) and obj.material_slots[mat_idx].material:
+                mat_name = obj.material_slots[mat_idx].material.name
+                mat_ref = self.mat_name_to_index.get(mat_name, 0)
+                # Name sub-objects: objectname_materialname
+                geom_name = f'{obj.name}_{mat_name}'
+
+            # Clone bmesh and keep only faces for this material
+            bm_sub = bm.copy()
+            faces_to_remove = [f for f in bm_sub.faces
+                               if f.material_index != mat_idx]
+            for f in faces_to_remove:
+                bm_sub.faces.remove(f)
+
+            # Remove orphan vertices
+            verts_to_remove = [v for v in bm_sub.verts if not v.link_faces]
+            for v in verts_to_remove:
+                bm_sub.verts.remove(v)
+
+            if len(bm_sub.faces) == 0:
+                bm_sub.free()
+                continue
+
+            bm_sub.faces.ensure_lookup_table()
+            bm_sub.verts.ensure_lookup_table()
+            bm_sub.edges.ensure_lookup_table()
+
+            # Create temporary mesh for the sub-object
+            sub_mesh = bpy.data.meshes.new(f'_ase_sub_{mat_idx}')
+            bm_sub.to_mesh(sub_mesh)
+
+            results.append(self._build_geomobject_from_data(
+                geom_name, sub_mesh, bm_sub, obj, mat_ref, xform=xform))
+
+            bm_sub.free()
+            bpy.data.meshes.remove(sub_mesh)
+
+        bm.free()
+        bpy.data.meshes.remove(mesh)
+        return ''.join(results)
+
+    def _build_geomobject_from_mesh(self, name, mesh, obj, material_ref, xform=None):
+        """Build a GEOMOBJECT from an already-prepared mesh object."""
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        bm.faces.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        result = self._build_geomobject_from_data(
+            name, mesh, bm, obj, material_ref, xform=xform)
+        bm.free()
+        return result
+
+    def _build_geomobject_from_data(self, name, mesh, bm, obj,
+                                     material_ref_override=None, xform=None):
+        """Core geometry builder working from mesh data + bmesh.
+
+        This is the main workhorse that generates the GEOMOBJECT block.
+        It writes vertices, faces, UVs, vertex colors, and normals.
+        """
+        scale = self.options['scale']
+
+        # Validate all faces are triangles
+        for face in bm.faces:
+            if len(face.verts) != 3:
+                raise RuntimeError(
+                    f'Mesh "{name}" contains non-triangulated faces. '
+                    f'Enable "Triangulate" in export options.')
+
+        num_verts = len(bm.verts)
+        num_faces = len(bm.faces)
+
+        # Auto-detect whether smoothing groups are needed:
+        # If any edge is sharp, export smoothing groups from sharp edge topology.
+        # If all edges are smooth, export a single smoothing group (group 1).
+        has_sharp_edges = any(not e.smooth for e in bm.edges)
+        smoothing_groups = {}
+        if has_sharp_edges:
+            smoothing_groups = compute_smoothing_groups(bm)
+        else:
+            # All smooth: single smoothing group for entire mesh
+            for face in bm.faces:
+                smoothing_groups[face.index] = 1
+
+        # MATERIAL_REF: determines which global material this GEOMOBJECT uses.
+        # Always passed explicitly by _build_geomobject.
+        if material_ref_override is not None:
+            mat_ref = material_ref_override
+        else:
+            mat_ref = 0
+
+        lines = []
+        lines.append(f'*GEOMOBJECT {{\n')
+        lines.append(f'\t*NODE_NAME "{name}"\n')
+
+        # NODE_TM (identity transform - transforms are baked)
+        lines.append(self._build_node_tm(name))
+
+        # MESH block
+        lines.append(f'\t*MESH {{\n')
+        lines.append(f'\t\t*TIMEVALUE 0\n')
+        lines.append(f'\t\t*MESH_NUMVERTEX {num_verts}\n')
+        lines.append(f'\t\t*MESH_NUMFACES {num_faces}\n')
+
+        # Vertex list (with transform and scale applied)
+        import mathutils
+        if xform is None:
+            xform = mathutils.Matrix.Identity(4)
+        # Normal transform is inverse-transpose of the upper 3x3
+        normal_xform = xform.to_3x3().inverted_safe().transposed()
+
+        lines.append(f'\t\t*MESH_VERTEX_LIST {{\n')
+        for v in bm.verts:
+            co = xform @ v.co
+            x = ase_float(co.x * scale)
+            y = ase_float(co.y * scale)
+            z = ase_float(co.z * scale)
+            lines.append(f'\t\t\t*MESH_VERTEX {v.index}\t{x}\t{y}\t{z}\n')
+        lines.append(f'\t\t}}\n')
+
+        # Face list
+        lines.append(f'\t\t*MESH_FACE_LIST {{\n')
+        for face in bm.faces:
+            v = face.verts
+            # MESH_MTLID is ignored by idTech 4 engine; material is
+            # resolved per-GEOMOBJECT via MATERIAL_REF. Write 0 always.
+            mtl_id = 0
+
+            # Smoothing group
+            sg = smoothing_groups.get(face.index, 0)
+            if sg > 0:
+                sg_val = ((sg - 1) % 32) + 1
+                sg_str = str(sg_val)
+            else:
+                sg_str = '0'
+
+            # Edge visibility (AB, BC, CA) - 1 if edge is not shared
+            edges = face.edges
+            ab = 1 if len(edges[0].link_faces) == 1 else 0
+            bc = 1 if len(edges[1].link_faces) == 1 else 0
+            ca = 1 if len(edges[2].link_faces) == 1 else 0
+
+            lines.append(
+                f'\t\t\t*MESH_FACE {face.index}:'
+                f'    A: {v[0].index:>5} B: {v[1].index:>5} C: {v[2].index:>5}'
+                f' AB: {ab:>4} BC: {bc:>4} CA: {ca:>4}'
+                f'\t *MESH_SMOOTHING {sg_str}'
+                f' \t*MESH_MTLID {mtl_id}\n'
+            )
+        lines.append(f'\t\t}}\n')
+
+        # UV coordinates (per-face-vertex, i.e. per loop)
+        uv_layers = mesh.uv_layers
+        if uv_layers and len(uv_layers) > 0:
+            # Primary UV channel
+            active_uv = uv_layers.active
+            if active_uv:
+                num_tverts = num_faces * 3
+                lines.append(f'\t\t*MESH_NUMTVERTEX {num_tverts}\n')
+                lines.append(f'\t\t*MESH_TVERTLIST {{\n')
+
+                tvert_idx = 0
+                for poly in mesh.polygons:
+                    for loop_idx in poly.loop_indices:
+                        uv = active_uv.data[loop_idx].uv
+                        lines.append(
+                            f'\t\t\t*MESH_TVERT {tvert_idx}\t'
+                            f'{ase_float(uv.x)}\t{ase_float(uv.y)}\t{ase_float(0.0)}\n')
+                        tvert_idx += 1
+                lines.append(f'\t\t}}\n')
+
+                lines.append(f'\t\t*MESH_NUMTVFACES {num_faces}\n')
+                lines.append(f'\t\t*MESH_TFACELIST {{\n')
+                for fi in range(num_faces):
+                    base = fi * 3
+                    lines.append(
+                        f'\t\t\t*MESH_TFACE {fi}\t{base}\t{base + 1}\t{base + 2}\n')
+                lines.append(f'\t\t}}\n')
+
+            # Additional UV mapping channels (channel 2+)
+            for ch_idx in range(1, len(uv_layers)):
+                uv_layer = uv_layers[ch_idx]
+                channel_num = ch_idx + 1
+                num_tverts = num_faces * 3
+                lines.append(f'\t\t*MESH_MAPPINGCHANNEL {channel_num} {{\n')
+                lines.append(f'\t\t\t*MESH_NUMTVERTEX {num_tverts}\n')
+                lines.append(f'\t\t\t*MESH_TVERTLIST {{\n')
+
+                tvert_idx = 0
+                for poly in mesh.polygons:
+                    for loop_idx in poly.loop_indices:
+                        uv = uv_layer.data[loop_idx].uv
+                        lines.append(
+                            f'\t\t\t\t*MESH_TVERT {tvert_idx}\t'
+                            f'{ase_float(uv.x)}\t{ase_float(uv.y)}\t{ase_float(0.0)}\n')
+                        tvert_idx += 1
+                lines.append(f'\t\t\t}}\n')
+
+                lines.append(f'\t\t\t*MESH_NUMTVFACES {num_faces}\n')
+                lines.append(f'\t\t\t*MESH_TFACELIST {{\n')
+                for fi in range(num_faces):
+                    base = fi * 3
+                    lines.append(
+                        f'\t\t\t\t*MESH_TFACE {fi}\t{base}\t{base + 1}\t{base + 2}\n')
+                lines.append(f'\t\t\t}}\n')
+                lines.append(f'\t\t}}\n')
+
+        # Vertex colors — read from bmesh loop color layers (reliable even
+        # for sub-meshes created via bm.to_mesh on a fresh Mesh object,
+        # where mesh.color_attributes may be empty or misconfigured).
+        bm_color_layer = None
+        if bm.loops.layers.color:
+            bm_color_layer = bm.loops.layers.color.active
+
+        # Fallback: try mesh.color_attributes / vertex_colors
+        mesh_vc_layer = None
+        if bm_color_layer is None:
+            if mesh.color_attributes and mesh.color_attributes.active_color:
+                mesh_vc_layer = mesh.color_attributes.active_color
+            elif hasattr(mesh, 'vertex_colors') and mesh.vertex_colors:
+                mesh_vc_layer = mesh.vertex_colors.active
+
+        if bm_color_layer is not None or mesh_vc_layer is not None:
+            num_cverts = num_faces * 3
+            lines.append(f'\t\t*MESH_NUMCVERTEX {num_cverts}\n')
+            lines.append(f'\t\t*MESH_CVERTLIST {{\n')
+
+            cvert_idx = 0
+            if bm_color_layer is not None:
+                # Read from bmesh (preferred — works for split meshes)
+                for face in bm.faces:
+                    for loop in face.loops:
+                        color = loop[bm_color_layer]
+                        lines.append(
+                            f'\t\t\t*MESH_VERTCOL {cvert_idx}\t'
+                            f'{ase_float(color[0])}\t{ase_float(color[1])}\t{ase_float(color[2])}\n')
+                        cvert_idx += 1
+            else:
+                # Fallback: read from mesh data
+                for poly in mesh.polygons:
+                    for loop_idx in poly.loop_indices:
+                        if hasattr(mesh_vc_layer, 'data') and len(mesh_vc_layer.data) > loop_idx:
+                            color = mesh_vc_layer.data[loop_idx].color
+                        else:
+                            color = (1.0, 1.0, 1.0, 1.0)
+                        lines.append(
+                            f'\t\t\t*MESH_VERTCOL {cvert_idx}\t'
+                            f'{ase_float(color[0])}\t{ase_float(color[1])}\t{ase_float(color[2])}\n')
+                        cvert_idx += 1
+            lines.append(f'\t\t}}\n')
+
+            lines.append(f'\t\t*MESH_NUMCVFACES {num_faces}\n')
+            lines.append(f'\t\t*MESH_CFACELIST {{\n')
+            for fi in range(num_faces):
+                base = fi * 3
+                lines.append(
+                    f'\t\t\t*MESH_CFACE {fi}\t{base}\t{base + 1}\t{base + 2}\n')
+            lines.append(f'\t\t}}\n')
+
+        # Normals - use split normals (per-loop) for correct hard/soft edge export.
+        # Sharp edges produce different normals on each side, which the engine
+        # uses to determine shading. Smoothing groups are ignored by idTech 4.
+        lines.append(f'\t\t*MESH_NORMALS {{\n')
+
+        # Blender 4.1+: corner_normals provides per-loop split normals directly.
+        # Blender <4.1: calc_normals_split() must be called first, then
+        #   mesh.loops[i].normal is available.
+        # Fallback: mesh.vertices[v].normal (averaged, loses sharp edges).
+        has_corner_normals = hasattr(mesh, 'corner_normals') and len(mesh.corner_normals) > 0
+        use_split_normals = False
+        if not has_corner_normals and hasattr(mesh, 'calc_normals_split'):
+            mesh.calc_normals_split()
+            use_split_normals = True
+
+        for poly in mesh.polygons:
+            fn = (normal_xform @ poly.normal).normalized()
+            lines.append(
+                f'\t\t\t*MESH_FACENORMAL {poly.index}\t'
+                f'{ase_float(fn.x)}\t{ase_float(fn.y)}\t{ase_float(fn.z)}\n')
+
+            for loop_idx in poly.loop_indices:
+                vert_idx = mesh.loops[loop_idx].vertex_index
+                if has_corner_normals:
+                    raw_n = mesh.corner_normals[loop_idx].vector
+                elif use_split_normals:
+                    raw_n = mesh.loops[loop_idx].normal
+                else:
+                    raw_n = mesh.vertices[vert_idx].normal
+                n = (normal_xform @ raw_n).normalized()
+                lines.append(
+                    f'\t\t\t\t*MESH_VERTEXNORMAL {vert_idx}\t'
+                    f'{ase_float(n.x)}\t{ase_float(n.y)}\t{ase_float(n.z)}\n')
+
+        lines.append(f'\t\t}}\n')
+
+        # Close MESH block
+        lines.append(f'\t}}\n')
+
+        # Properties
+        lines.append(f'\t*PROP_MOTIONBLUR 0\n')
+        lines.append(f'\t*PROP_CASTSHADOW 1\n')
+        lines.append(f'\t*PROP_RECVSHADOW 1\n')
+        lines.append(f'\t*MATERIAL_REF {mat_ref}\n')
+
+        # Close GEOMOBJECT
+        lines.append(f'}}\n')
+
+        return ''.join(lines)
+
+    def _build_node_tm(self, name):
+        """Build an identity NODE_TM block. Transforms are baked into vertex data."""
+        return (
+            f'\t*NODE_TM {{\n'
+            f'\t\t*NODE_NAME "{name}"\n'
+            f'\t\t*INHERIT_POS 0 0 0\n'
+            f'\t\t*INHERIT_ROT 0 0 0\n'
+            f'\t\t*INHERIT_SCL 0 0 0\n'
+            f'\t\t*TM_ROW0 1.0000\t0.0000\t0.0000\n'
+            f'\t\t*TM_ROW1 0.0000\t1.0000\t0.0000\n'
+            f'\t\t*TM_ROW2 0.0000\t0.0000\t1.0000\n'
+            f'\t\t*TM_ROW3 0.0000\t0.0000\t0.0000\n'
+            f'\t\t*TM_POS 0.0000\t0.0000\t0.0000\n'
+            f'\t\t*TM_ROTAXIS 0.0000\t0.0000\t0.0000\n'
+            f'\t\t*TM_ROTANGLE 0.0000\n'
+            f'\t\t*TM_SCALE 1.0000\t1.0000\t1.0000\n'
+            f'\t\t*TM_SCALEAXIS 0.0000\t0.0000\t0.0000\n'
+            f'\t\t*TM_SCALEAXISANG 0.0000\n'
+            f'\t}}\n'
+        )
+
+
+# =============================================================================
+# Blender Operator
+# =============================================================================
+
+class ExportASE(bpy.types.Operator, ExportHelper):
+    """Export selected meshes to ASCII Scene Export (.ase) format for idTech 4"""
+    bl_idname = "export_scene.ase"
+    bl_label = "Export ASE"
+    bl_options = {'PRESET'}
     filename_ext = ".ase"
     filter_glob: StringProperty(default="*.ase", options={'HIDDEN'})
 
     filepath: StringProperty(
         name="File Path",
-        description="File path used for exporting the ASE file",
+        description="Output file path",
         maxlen=1024,
-        default="")
+        default="",
+    )
 
-    option_triangulate: BoolProperty(
-            name="Triangulate",
-            description="Triangulates all exportable objects",
-            default=False)
+    # -- Essentials --
 
-    option_normals: BoolProperty(
-            name="Recalculate Normals",
-            description="Recalculate normals before exporting",
-            default=True)
+    option_apply_modifiers: BoolProperty(
+        name="Apply Modifiers",
+        description=(
+            "Apply modifiers before exporting. "
+            "If a Triangulate modifier is present, it will be used. "
+            "If not, the mesh is triangulated automatically. "
+            "When unchecked, modifiers are ignored and the mesh is "
+            "triangulated directly"
+        ),
+        default=True,
+    )
 
-    option_remove_doubles: BoolProperty(
-            name="Remove Doubles",
-            description="Remove any duplicate vertices before exporting",
-            default=True)
+    # -- Transformations --
 
     option_apply_scale: BoolProperty(
-            name="Scale",
-            description="Apply scale transformation",
-            default=True)
-
-    option_apply_location: BoolProperty(
-            name="Location",
-            description="Apply location transformation",
-            default=True)
+        name="Apply Scale",
+        description="Bake object scale into vertex positions",
+        default=True,
+    )
 
     option_apply_rotation: BoolProperty(
-            name="Rotation",
-            description="Apply rotation transformation",
-            default=True)
+        name="Apply Rotation",
+        description="Bake object rotation into vertex positions",
+        default=True,
+    )
 
-    option_submaterials: BoolProperty(
-            name="Sub Materials",
-            description="Use sub-materials",
-            default=False)
+    option_apply_location: BoolProperty(
+        name="Apply Location",
+        description="Bake object location into vertex positions",
+        default=True,
+    )
 
-    option_smoothing_groups: BoolProperty(
-            name="Smoothing Groups",
-            description="Use smoothing groups",
-            default=False)
-
-    option_allow_multi_mats: BoolProperty(
-            name="Allow Multi Materials",
-            description="Allow multiple materials per mesh",
-            default=True)
-
-    option_separate: BoolProperty(
-            name="Separate",
-            description="A separate ASE file for every selected object",
-            default=False)
-    
-    option_split: BoolProperty(
-            name="Split per material",
-            description="Split object into several per material",
-            default=False)
+    # -- Advanced --
 
     option_scale: FloatProperty(
-            name="Scale",
-            description="Object scaling factor (default: 1.0)",
-            min=0.01,
-            max=1000.0,
-            soft_min=0.01,
-            soft_max=1000.0,
-            default=16.0)
-    
-    option_copy: BoolProperty(
-            name="Export Copy",
-            description="Export a copy of the objects, use e.g. together with triangulate modifier",
-            default=True)
+        name="Scale",
+        description=(
+            "Multiply all vertex positions by this factor. "
+            "idTech 4 uses roughly 1 unit = 1 inch. "
+            "Default 1.0 exports at Blender's native scale"
+        ),
+        min=0.001,
+        max=10000.0,
+        soft_min=0.01,
+        soft_max=1000.0,
+        default=1.0,
+    )
+
+    option_individual: BoolProperty(
+        name="Export individual models",
+        description=(
+            "Export each selected object as its own .ase file. "
+            "Useful for batch-exporting a scene of separate models"
+        ),
+        default=False,
+    )
+
+    option_split_per_material: BoolProperty(
+        name="Split per material",
+        description=(
+            "Split each object into separate ASE files by material. "
+            "Output files are named <object>_chunk000.ase, _chunk001.ase, etc. "
+            "Vertex colors and normals are preserved for seamless appearance"
+        ),
+        default=False,
+    )
+
+    option_lod_groups: BoolProperty(
+        name="Export LOD groups",
+        description=(
+            "Export Empty-based LOD groups. Each selected Empty that has "
+            "parented mesh children is exported as a single .ase file "
+            "named after the Empty. All child meshes become GEOMOBJECTs "
+            "in that file. Unparented meshes are ignored"
+        ),
+        default=False,
+    )
 
     def draw(self, context):
         layout = self.layout
 
         box = layout.box()
         box.label(text='Essentials:')
-        box.prop(self, 'option_triangulate')
-        box.prop(self, 'option_copy')
-        box.prop(self, 'option_normals')
-        box.prop(self, 'option_remove_doubles')
-        box.label(text="Transformations:")
+        box.prop(self, 'option_apply_modifiers')
+
+        box = layout.box()
+        box.label(text='Transformations:')
         box.prop(self, 'option_apply_scale')
         box.prop(self, 'option_apply_rotation')
         box.prop(self, 'option_apply_location')
-        box.label(text="Advanced:")
+
+        box = layout.box()
+        box.label(text='Advanced:')
         box.prop(self, 'option_scale')
-        box.prop(self, 'option_separate')
-        box.prop(self, 'option_split')
-        box.prop(self, 'option_submaterials')
-        box.prop(self, 'option_smoothing_groups')
-        box.prop(self, 'option_allow_multi_mats')
-        
+        box.prop(self, 'option_individual')
+        box.prop(self, 'option_split_per_material')
+        box.prop(self, 'option_lod_groups')
+
     @classmethod
     def poll(cls, context):
-        active = context.active_object
-        selected = context.selected_objects
-        camera = context.scene.camera
-        ok = selected or camera
-        return ok
-
-    def writeASE(self, filename, data):
-        print('\nWriting', filename)
-        try:
-            file = open(filename, 'w')
-        except IOError:
-            print('Error: The file could not be written to. Aborting.')
-        else:
-            file.write(data)
-            file.close()
+        return any(obj.type in {'MESH', 'EMPTY'} for obj in context.selected_objects)
 
     def execute(self, context):
         start = time.perf_counter()
 
-        global optionScale
-        global optionSubmaterials
-        global optionSmoothingGroups
-        global optionAllowMultiMats
+        options = {
+            'scale': self.option_scale,
+            'apply_modifiers': self.option_apply_modifiers,
+            'apply_location': self.option_apply_location,
+            'apply_rotation': self.option_apply_rotation,
+            'apply_scale': self.option_apply_scale,
+        }
 
-        global aseHeader
-        global aseScene
-        global aseMaterials
-        global aseGeometry
+        try:
+            builder = ASEBuilder(context, options)
+            base_dir = os.path.dirname(self.filepath)
 
-        global currentMatId
-        global numMats
-        global matList
+            # Track which mesh objects are consumed by LOD groups
+            lod_children = set()
 
-        aseHeader = ''
-        aseScene = ''
-        aseMaterials = ''
-        aseGeometry = ''
+            if self.option_lod_groups:
+                # LOD Groups: each selected Empty with mesh children
+                # becomes one ASE file named after the Empty.
+                empties = [obj for obj in context.selected_objects
+                           if obj.type == 'EMPTY']
 
-        optionScale = self.option_scale
-        optionSubmaterials = self.option_submaterials
-        optionSmoothingGroups = self.option_smoothing_groups
-        optionAllowMultiMats = self.option_allow_multi_mats
+                for empty in empties:
+                    children = [child for child in empty.children
+                                if child.type == 'MESH']
+                    if not children:
+                        print(f'ASE Export: Empty "{empty.name}" has no '
+                              f'mesh children, skipping')
+                        continue
 
-        matList = []
-        currentMatId = 0
-        numMats = 0
+                    print(f'ASE Export: LOD group "{empty.name}" with '
+                          f'{len(children)} mesh(es)')
 
-        print('\nAscii Scene Export by MCampagnini\n')
-        print('Objects selected: ' + str(len(bpy.context.selected_objects)))
-        aseHeader = str(cHeader())
-        aseScene = str(cScene())
-        aseMaterials = str(cMaterials())
+                    ase_content = builder.build(children)
+                    filename = os.path.join(
+                        base_dir,
+                        empty.name.replace('.', '_') + '.ase')
+                    self._write_file(filename, ase_content)
 
-        for object in bpy.context.selected_objects:
-            if object.type == 'MESH':
-                context.view_layer.objects.active = object
-                object.select_set(True)
+                    # Mark these meshes as consumed
+                    for child in children:
+                        lod_children.add(child)
 
-                bpy.ops.object.mode_set(mode='EDIT')
-                if self.option_remove_doubles:
-                    bpy.ops.mesh.select_all(action='SELECT')
-                    bpy.ops.mesh.remove_doubles()
-                if self.option_triangulate:
-                    print(object.name + ': Converting to triangles')
-                    bpy.ops.mesh.select_all(action='SELECT')
-                    bpy.ops.mesh.quads_convert_to_tris()
-                if self.option_normals:
-                    print(object.name + ': Recalculating normals')
-                    bpy.ops.mesh.select_all(action='SELECT')
-                    bpy.ops.mesh.normals_make_consistent()
+            # Collect remaining selected mesh objects (not part of LOD groups)
+            mesh_objects = [obj for obj in context.selected_objects
+                           if obj.type == 'MESH' and obj not in lod_children]
 
-                bpy.ops.object.mode_set(mode='OBJECT')
-                bpy.ops.object.transform_apply(location=self.option_apply_location, rotation=self.option_apply_rotation, scale=self.option_apply_scale)
+            if not mesh_objects and not lod_children:
+                self.report({'ERROR'}, 'No mesh objects or LOD groups found')
+                return {'CANCELLED'}
 
-                aseGeom = ''
-                if self.option_copy:
-                    orig_mesh = object.data
-                    depsgraph = context.evaluated_depsgraph_get()
-                    object_eval = object.evaluated_get(depsgraph)
-                    meshes = [bpy.data.meshes.new_from_object(object_eval)]
+            if mesh_objects:
+                print(f'ASE Export: {len(mesh_objects)} loose mesh object(s)')
 
-                    if self.option_split:
-                        object.data = meshes[0]
-                        bpy.ops.object.mode_set(mode='EDIT')
-                        meshes = []
-                        bm = bmesh.from_edit_mesh(object.data)
-                        for midx, mslot in enumerate(object.material_slots):
-                            mat = mslot.material
-                            if mat:
-                                bm_new = bm.copy()
-                                faces = None
-                                for f in bm_new.faces:
-                                    if f.material_index == midx:
-                                        faces = set(bmesh.ops.similar_faces(bm_new, faces=[f], type=201)['faces'])
-                                        faces = [f for f in bm_new.faces if f not in faces]
-                                        break
-                                if faces:
-                                    for f in faces:
-                                        bm_new.faces.remove(f)
-                                    new_mesh = orig_mesh.copy()
-                                    bm_new.to_mesh(new_mesh)
-                                    meshes.append(new_mesh)
-                        bpy.ops.object.mode_set(mode='OBJECT')
-                        old_mesh = object.data
-                        object.data = orig_mesh
-                        bpy.data.meshes.remove(old_mesh)
+                if self.option_split_per_material:
+                    # Split mode: each object produces multiple chunk files
+                    for obj in mesh_objects:
+                        chunks = builder.build_split(obj)
 
-                    for mesh in meshes:
-                        object.data = mesh
-                        aseGeom += str(cGeomObject(object))
+                        for suffix, ase_content in chunks:
+                            chunk_path = os.path.join(
+                                base_dir, f'{obj.name}{suffix}.ase')
+                            self._write_file(chunk_path, ase_content)
 
-                    object.data = orig_mesh
-                    for mesh in meshes:
-                        bpy.data.meshes.remove(mesh)
+                elif self.option_individual:
+                    # Individual mode: one file per object
+                    for obj in mesh_objects:
+                        ase_content = builder.build([obj])
+                        filename = os.path.join(
+                            base_dir, obj.name.replace('.', '_') + '.ase')
+                        self._write_file(filename, ase_content)
+
                 else:
-                    aseGeom = str(cGeomObject(object))
-                
-                if self.option_separate:
-                    aseModel = aseHeader + aseScene + aseMaterials + aseGeom
-                    filename = os.path.dirname(self.filepath) + os.sep + object.name.replace('.', '_') + ".ase"
-                    self.writeASE(filename, aseModel)
-                else:
-                    aseGeometry += aseGeom
+                    # Normal mode: all objects in one file
+                    ase_content = builder.build(mesh_objects)
+                    self._write_file(self.filepath, ase_content)
 
-        if not self.option_separate:
-            aseModel = aseHeader + aseScene + aseMaterials + aseGeometry
-            self.writeASE(self.filepath, aseModel)
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
 
-        lapse = (time.perf_counter() - start)
-        print('Completed in ' + str(lapse) + ' seconds')
+        elapsed = time.perf_counter() - start
+        print(f'ASE Export completed in {elapsed:.3f}s')
+        self.report({'INFO'}, f'ASE export completed in {elapsed:.3f}s')
 
         return {'FINISHED'}
 
-def menu_func(self, context):
-    self.layout.operator(ExportAse.bl_idname, text="Ascii Scene Exporter (.ase) v2.5.8")
+    def _write_file(self, filepath, data):
+        """Write ASE data string to file."""
+        print(f'Writing: {filepath}')
+        try:
+            with open(filepath, 'w', newline='\n') as f:
+                f.write(data)
+        except IOError as e:
+            raise RuntimeError(f'Could not write file: {filepath}\n{e}')
+
+
+# =============================================================================
+# Registration
+# =============================================================================
+
+def menu_func_export(self, context):
+    self.layout.operator(ExportASE.bl_idname, text="ASCII Scene Export (.ase)")
+
 
 def register():
-    bpy.utils.register_class(ExportAse)
-    bpy.types.TOPBAR_MT_file_export.append(menu_func)
+    bpy.utils.register_class(ExportASE)
+    bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
+
 
 def unregister():
-    bpy.utils.unregister_class(ExportAse)
-    bpy.types.TOPBAR_MT_file_export.remove(menu_func)
+    bpy.utils.unregister_class(ExportASE)
+    bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+
 
 if __name__ == "__main__":
     register()
