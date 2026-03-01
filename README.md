@@ -1,5 +1,6 @@
 # blender-ase
-io_export_idt4ase - refactored and optimized ASE export add-on to work with Blender 4.5+
+io_import_idt4ase - ASE import add-on for Blender 4.5+
+io_export_idt4ase - refactored and optimized ASE export add-on for Blender 4.5+
 
 What's new:
 - much faster than the old ASE export add-on
