@@ -19,7 +19,7 @@
 bl_info = {
     "name": "ASE Exporter for idTech 4",
     "author": "Richard Bartlett, MCampagnini, scorpion81, motorsep/Claude",
-    "version": (3, 5, 0),
+    "version": (3, 7, 0),
     "blender": (4, 2, 0),
     "location": "File > Export > ASCII Scene Export (.ase)",
     "description": "Export static meshes to ASCII Scene Export (.ase) format for idTech 4",
@@ -130,6 +130,32 @@ def get_bitmap_path(mat):
 
 
 # =============================================================================
+# MultiUV: which UV map does a material sample?
+#
+# Blender's own answer is the UV Map node in the material's node tree, which
+# is also what makes the viewport preview the right map. Prefer the node
+# wired into an Image Texture's Vector input; otherwise any UV Map node.
+# =============================================================================
+
+def material_uv_map_name(mat):
+    if mat is None or not mat.use_nodes or mat.node_tree is None:
+        return None
+    nodes = mat.node_tree.nodes
+    for node in nodes:
+        if node.type != 'TEX_IMAGE':
+            continue
+        vec = node.inputs.get('Vector')
+        if vec is not None and vec.is_linked:
+            src = vec.links[0].from_node
+            if src.type == 'UVMAP' and src.uv_map:
+                return src.uv_map
+    for node in nodes:
+        if node.type == 'UVMAP' and node.uv_map:
+            return node.uv_map
+    return None
+
+
+# =============================================================================
 # Smoothing group computation (non-destructive, bmesh-based)
 # =============================================================================
 
@@ -221,6 +247,7 @@ class ASEBuilder:
         self.options = options
         self.material_list = []  # ordered list of unique materials
         self.mat_name_to_index = {}  # material name -> index in material_list
+        self.frames = {}  # object name -> captured MikkT corner frames (see _capture_tangent_frames)
 
     def build(self, objects):
         """Build complete ASE content for the given mesh objects.
@@ -461,12 +488,16 @@ class ASEBuilder:
             # Check if a Triangulate modifier was present on the object
             has_tri_mod = any(
                 mod.type == 'TRIANGULATE' for mod in obj.modifiers)
-
-            if not has_tri_mod:
-                self._triangulate_mesh(mesh)
+            needs_triangulation = not has_tri_mod
         else:
             # Ignore modifiers: get raw mesh data
             mesh = bpy.data.meshes.new_from_object(obj)
+            needs_triangulation = True
+
+        if self.options.get('mikkt', False):
+            # Captures normals, triangulates, computes MikkTSpace, tags corners.
+            self._capture_tangent_frames(obj, mesh, needs_triangulation)
+        elif needs_triangulation:
             self._triangulate_mesh(mesh)
 
         bm = bmesh.new()
@@ -484,6 +515,131 @@ class ASEBuilder:
         bmesh.ops.triangulate(bm, faces=bm.faces[:])
         bm.to_mesh(mesh)
         bm.free()
+
+    # -------------------------------------------------------------------------
+    # MikkT capture (Fall of Phaeton engine)
+    # -------------------------------------------------------------------------
+
+    SRC_LOOP_LAYER = 'ase_src_loop'
+
+    def _capture_tangent_frames(self, obj, mesh, needs_triangulation):
+        """Per corner of the final (triangulated) mesh: normal, MikkTSpace
+        tangent, bitangent sign, all in object space.
+
+        Corner normals are read from the source mesh BEFORE any topology
+        change: Blender stores custom split normals relative to per-vertex
+        fan spaces, and triangulating in bmesh re-decodes them against new
+        fans (measured up to 17 degrees of drift). They are re-applied as
+        custom normals on the triangulated mesh so calc_tangents builds
+        MikkTSpace against exactly the normals that get written.
+
+        An int corner attribute holds each corner's index into the captured
+        arrays. It survives the bmesh copies used for per-material splits,
+        so sub-meshes look up the same frames (and the same normals, which
+        also keeps material borders identical to Blender instead of
+        recomputing them on a mesh with the neighbours cut away).
+        """
+        import mathutils
+
+        src_vertex = [l.vertex_index for l in mesh.loops]
+        src_normals = [mathutils.Vector(c.vector) for c in mesh.corner_normals]
+
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        layer = bm.loops.layers.int.new(self.SRC_LOOP_LAYER)
+        for face in bm.faces:
+            for loop in face.loops:
+                loop[layer] = loop.index
+        if needs_triangulation:
+            bmesh.ops.triangulate(bm, faces=bm.faces[:])
+        bm.to_mesh(mesh)
+        bm.free()
+
+        attr = mesh.attributes.get(self.SRC_LOOP_LAYER)
+        if attr is None:
+            raise RuntimeError('Internal error: corner mapping missing on "%s"' % obj.name)
+
+        normals = []
+        for li, loop in enumerate(mesh.loops):
+            src = attr.data[li].value
+            if src_vertex[src] != loop.vertex_index:
+                raise RuntimeError('Internal error: corner mapping lost on "%s"' % obj.name)
+            normals.append(src_normals[src])
+        mesh.normals_split_custom_set(normals)
+
+        # From here on the attribute indexes the FINAL corners.
+        for li in range(len(mesh.loops)):
+            attr.data[li].value = li
+
+        # MikkTSpace per UV map actually sampled: each polygon's corners take
+        # the tangents computed against the map its material uses (MultiUV),
+        # or the active map for everything. Corners without a map stay None.
+        uv_by_slot = self._resolve_uv_layers(obj, mesh)
+        num_loops = len(mesh.loops)
+        tangents = [None] * num_loops
+        signs = [None] * num_loops
+        layer_names = []
+        for layer in uv_by_slot.values():
+            if layer is not None and layer.name not in layer_names:
+                layer_names.append(layer.name)
+        if not layer_names:
+            print('ASE Export: "%s" has no UV map; MikkT tangents skipped, normals still exported'
+                  % obj.name)
+        for lname in layer_names:
+            mesh.calc_tangents(uvmap=lname)
+            try:
+                loops = mesh.loops
+                for poly in mesh.polygons:
+                    layer = uv_by_slot.get(poly.material_index)
+                    if layer is None or layer.name != lname:
+                        continue
+                    for li in range(poly.loop_start, poly.loop_start + poly.loop_total):
+                        tangents[li] = mathutils.Vector(loops[li].tangent)
+                        signs[li] = loops[li].bitangent_sign
+            finally:
+                mesh.free_tangents()
+        self.frames[obj.name] = {
+            'normals': [mathutils.Vector(c.vector) for c in mesh.corner_normals],
+            'tangents': tangents if any(t is not None for t in tangents) else None,
+            'signs': signs,
+        }
+
+    def _resolve_uv_layers(self, obj, mesh):
+        """{material_index: uv_layer or None} for every slot used by a face.
+
+        MultiUV off: the mesh's active UV map for every slot. MultiUV on:
+        the map named by the material's UV Map node, falling back to the
+        active map (with a console warning) when the mesh has no such map.
+        """
+        default = mesh.uv_layers.active if mesh.uv_layers else None
+        result = {}
+        for mi in set(p.material_index for p in mesh.polygons):
+            layer = default
+            if self.options.get('multiuv', False):
+                slots = obj.material_slots
+                mat = slots[mi].material if mi < len(slots) else None
+                wanted = material_uv_map_name(mat)
+                if wanted:
+                    found = mesh.uv_layers.get(wanted)
+                    if found is None:
+                        print('ASE Export: material "%s" samples UV map "%s" but object "%s" '
+                              'has no such map; using "%s"' % (
+                                  mat.name, wanted, obj.name, default.name if default else 'none'))
+                    else:
+                        layer = found
+            result[mi] = layer
+        return result
+
+    def _corner_frames(self, obj, mesh):
+        """(frames, src_index_per_corner) for a mesh derived from obj, or
+        (None, None) when MikkT capture is off."""
+        frames = self.frames.get(obj.name)
+        if frames is None:
+            return None, None
+        attr = mesh.attributes.get(self.SRC_LOOP_LAYER)
+        if attr is None:
+            raise RuntimeError('Internal error: corner mapping missing on "%s"' % obj.name)
+        return frames, [attr.data[li].value for li in range(len(mesh.loops))]
 
     def _build_geomobject(self, obj):
         """Build GEOMOBJECT block(s) for a Blender object.
@@ -674,8 +830,21 @@ class ASEBuilder:
         # UV coordinates (per-face-vertex, i.e. per loop)
         uv_layers = mesh.uv_layers
         if uv_layers and len(uv_layers) > 0:
-            # Primary UV channel
+            # Primary UV channel: the active map, or with MultiUV the map this
+            # GEOMOBJECT's material samples (one material per GEOMOBJECT, so
+            # one map). Sub-meshes keep every UV layer of the source mesh.
             active_uv = uv_layers.active
+            if self.options.get('multiuv', False) and 0 <= mat_ref < len(self.material_list):
+                mat = self.material_list[mat_ref]
+                wanted = material_uv_map_name(mat)
+                if wanted:
+                    found = uv_layers.get(wanted)
+                    if found is None:
+                        print('ASE Export: material "%s" samples UV map "%s" but "%s" has no '
+                              'such map; using "%s"' % (
+                                  mat.name, wanted, name, active_uv.name if active_uv else 'none'))
+                    else:
+                        active_uv = found
             if active_uv:
                 num_tverts = num_faces * 3
                 lines.append(f'\t\t*MESH_NUMTVERTEX {num_tverts}\n')
@@ -794,6 +963,9 @@ class ASEBuilder:
             mesh.calc_normals_split()
             use_split_normals = True
 
+        # MikkT: normals come from the capture so they match the tangents exactly.
+        frames, src_of = self._corner_frames(obj, mesh)
+
         for poly in mesh.polygons:
             fn = (normal_xform @ poly.normal).normalized()
             lines.append(
@@ -802,7 +974,9 @@ class ASEBuilder:
 
             for loop_idx in poly.loop_indices:
                 vert_idx = mesh.loops[loop_idx].vertex_index
-                if has_corner_normals:
+                if frames is not None:
+                    raw_n = frames['normals'][src_of[loop_idx]]
+                elif has_corner_normals:
                     raw_n = mesh.corner_normals[loop_idx].vector
                 elif use_split_normals:
                     raw_n = mesh.loops[loop_idx].normal
@@ -814,6 +988,34 @@ class ASEBuilder:
                     f'{ase_float(n.x)}\t{ase_float(n.y)}\t{ase_float(n.z)}\n')
 
         lines.append(f'\t\t}}\n')
+
+        # MikkTSpace tangents (Fall of Phaeton engine extension). Same layout
+        # as MESH_NORMALS; stock idTech 4 streams past the unknown block.
+        # Tangents transform with the matrix itself (normals with its
+        # inverse-transpose) and are re-orthogonalized against the written
+        # normal; a mirroring transform flips the bitangent sign.
+        if frames is not None and frames['tangents'] is not None:
+            tangent_xform = xform.to_3x3()
+            sign_flip = -1.0 if xform.determinant() < 0.0 else 1.0
+            lines.append(f'\t\t*MESH_TANGENTS {{\n')
+            for poly in mesh.polygons:
+                lines.append(f'\t\t\t*MESH_FACETANGENT {poly.index}\n')
+                for loop_idx in poly.loop_indices:
+                    vert_idx = mesh.loops[loop_idx].vertex_index
+                    src = src_of[loop_idx]
+                    n = (normal_xform @ frames['normals'][src]).normalized()
+                    t_src = frames['tangents'][src]
+                    if t_src is None:
+                        # no UV map for this corner's material: the engine
+                        # derives tangents for this surface instead
+                        continue
+                    t = tangent_xform @ t_src
+                    t = (t - n * n.dot(t)).normalized()
+                    sign = frames['signs'][src] * sign_flip
+                    lines.append(
+                        f'\t\t\t\t*MESH_VERTEXTANGENT {vert_idx}\t'
+                        f'{ase_float(t.x)}\t{ase_float(t.y)}\t{ase_float(t.z)}\t{ase_float(sign)}\n')
+            lines.append(f'\t\t}}\n')
 
         # Close MESH block
         lines.append(f'\t}}\n')
@@ -882,6 +1084,27 @@ class ExportASE(bpy.types.Operator, ExportHelper):
             "triangulated directly"
         ),
         default=True,
+    )
+
+    option_mikkt: BoolProperty(
+        name="MikkT (Fall of Phaeton engine)",
+        description=(
+            "Also write a *MESH_TANGENTS block with MikkTSpace tangents "
+            "computed against the exported split normals, so the engine "
+            "decodes normal maps in the frame they were baked in. Only the "
+            "Fall of Phaeton engine reads it; stock idTech 4 skips the block"
+        ),
+        default=False,
+    )
+
+    option_multiuv: BoolProperty(
+        name="MultiUV (per-material UV maps)",
+        description=(
+            "Each material samples the UV map named by the UV Map node in its "
+            "node tree; its GEOMOBJECT is written with that map. Materials "
+            "without a UV Map node use the mesh's active UV map. See MULTIUV.md"
+        ),
+        default=False,
     )
 
     # -- Transformations --
@@ -956,6 +1179,8 @@ class ExportASE(bpy.types.Operator, ExportHelper):
         box = layout.box()
         box.label(text='Essentials:')
         box.prop(self, 'option_apply_modifiers')
+        box.prop(self, 'option_mikkt')
+        box.prop(self, 'option_multiuv')
 
         box = layout.box()
         box.label(text='Transformations:')
@@ -983,6 +1208,8 @@ class ExportASE(bpy.types.Operator, ExportHelper):
             'apply_location': self.option_apply_location,
             'apply_rotation': self.option_apply_rotation,
             'apply_scale': self.option_apply_scale,
+            'mikkt': self.option_mikkt,
+            'multiuv': self.option_multiuv,
         }
 
         try:

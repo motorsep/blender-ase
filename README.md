@@ -9,6 +9,8 @@ What's new:
 - exports multi-material meshes correctly
 - exports LOD groups (LODed meshes to work with StormEngine2 and RBDoom 3 BFG)
 - batch export (exports multiple meshes at one, including LODed meshes and split meshes)
+- MikkT option: writes a *MESH_TANGENTS block with MikkTSpace tangents computed against the exported split normals (Fall of Phaeton engine; stock idTech 4 skips the block)
+- MultiUV option: each material samples the UV map named by the UV Map node in its node tree, so one mesh can carry e.g. a body map and a GUI screen map. Setup and rules in [MULTIUV.md](MULTIUV.md)
 
 io_export_ase - ASE Exporter for Blender 3.4.1
 
