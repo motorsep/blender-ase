@@ -19,7 +19,7 @@
 bl_info = {
     "name": "ASE Exporter for idTech 4",
     "author": "Richard Bartlett, MCampagnini, scorpion81, motorsep/Claude",
-    "version": (3, 7, 0),
+    "version": (3, 8, 0),
     "blender": (4, 2, 0),
     "location": "File > Export > ASCII Scene Export (.ase)",
     "description": "Export static meshes to ASCII Scene Export (.ase) format for idTech 4",
@@ -586,7 +586,21 @@ class ASEBuilder:
             print('ASE Export: "%s" has no UV map; MikkT tangents skipped, normals still exported'
                   % obj.name)
         for lname in layer_names:
-            mesh.calc_tangents(uvmap=lname)
+            # Precomputed frames win: a mesh that is one piece of a larger
+            # continuous surface (terrain chunks) carries MikkT computed on
+            # the WHOLE surface in corner attributes mikkt_tangent.<uv> /
+            # mikkt_sign.<uv>. Recomputing here would average each border
+            # vertex over this piece's faces only and the neighbouring piece
+            # would disagree, showing a seam under normal mapping.
+            pre_t = mesh.attributes.get('mikkt_tangent.' + lname)
+            pre_s = mesh.attributes.get('mikkt_sign.' + lname)
+            precomputed = (pre_t is not None and pre_s is not None
+                           and pre_t.domain == 'CORNER' and pre_s.domain == 'CORNER'
+                           and pre_t.data_type == 'FLOAT_VECTOR' and pre_s.data_type == 'FLOAT')
+            if precomputed:
+                print('ASE Export: "%s" uses precomputed MikkT frames for UV map "%s"' % (obj.name, lname))
+            else:
+                mesh.calc_tangents(uvmap=lname)
             try:
                 loops = mesh.loops
                 for poly in mesh.polygons:
@@ -594,10 +608,15 @@ class ASEBuilder:
                     if layer is None or layer.name != lname:
                         continue
                     for li in range(poly.loop_start, poly.loop_start + poly.loop_total):
-                        tangents[li] = mathutils.Vector(loops[li].tangent)
-                        signs[li] = loops[li].bitangent_sign
+                        if precomputed:
+                            tangents[li] = mathutils.Vector(pre_t.data[li].vector)
+                            signs[li] = pre_s.data[li].value
+                        else:
+                            tangents[li] = mathutils.Vector(loops[li].tangent)
+                            signs[li] = loops[li].bitangent_sign
             finally:
-                mesh.free_tangents()
+                if not precomputed:
+                    mesh.free_tangents()
         self.frames[obj.name] = {
             'normals': [mathutils.Vector(c.vector) for c in mesh.corner_normals],
             'tangents': tangents if any(t is not None for t in tangents) else None,
@@ -1011,7 +1030,15 @@ class ASEBuilder:
                         continue
                     t = tangent_xform @ t_src
                     t = (t - n * n.dot(t)).normalized()
-                    sign = frames['signs'][src] * sign_flip
+                    # The engine's ASE parser flips V on load (t = 1 - v in
+                    # ASE_KeyMESH_TVERTLIST), which mirrors texture space and
+                    # therefore the bitangent. MikkT was computed in Blender's
+                    # unflipped UV space, so the handedness written here must
+                    # be negated to describe the same frame in the engine's
+                    # space; otherwise every normal-mapped surface is lit from
+                    # the wrong side (verified numerically against the frame
+                    # R_DeriveTangents builds from the same UVs).
+                    sign = -frames['signs'][src] * sign_flip
                     lines.append(
                         f'\t\t\t\t*MESH_VERTEXTANGENT {vert_idx}\t'
                         f'{ase_float(t.x)}\t{ase_float(t.y)}\t{ase_float(t.z)}\t{ase_float(sign)}\n')
